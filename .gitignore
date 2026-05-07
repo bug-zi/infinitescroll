@@ -1,0 +1,12 @@
+node_modules
+dist
+.env
+.env.local
+.env.*.local
+output
+public/generated
+*.tsbuildinfo
+.playwright-cli
+.superpowers
+*.log
+coverage

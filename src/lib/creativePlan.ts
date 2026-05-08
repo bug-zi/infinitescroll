@@ -1,4 +1,4 @@
-import type { CreativePlan } from "../types";
+import type { CreativePlan } from "../types.js";
 
 export type CreativePlanInput = {
   theme?: string | null;

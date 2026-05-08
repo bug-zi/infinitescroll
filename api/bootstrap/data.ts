@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { createSupabaseAdmin } from "../_lib/supabaseAdmin";
-import { formatUnknownError } from "../../src/lib/errorFormatting";
+import { createSupabaseAdmin } from "../_lib/supabaseAdmin.js";
+import { formatUnknownError } from "../../src/lib/errorFormatting.js";
 
 export default async function handler(_request: VercelRequest, response: VercelResponse) {
   try {

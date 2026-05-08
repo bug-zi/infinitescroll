@@ -1,12 +1,12 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { generateImage, generateOutpaintedImage } from "../_lib/ai";
-import { getCandidateScrollFilters, isStaleRunningJob } from "../_lib/generationPlan";
-import { getScrollImageDimensions } from "../_lib/imageDimensions";
-import { calculateVisibleSeamQualityScore, copyPreviousOverlapIntoNewImage, extractRightOverlapByWidth, normalizeImageBuffer } from "../_lib/stitchImages";
-import { createSupabaseAdmin } from "../_lib/supabaseAdmin";
-import { isCronRequestAuthorized } from "../_lib/cronAuth";
-import { buildCreativePlanPromptSection, createCreativePlan, normalizeCreativePlan } from "../../src/lib/creativePlan";
-import { formatUnknownError } from "../../src/lib/errorFormatting";
+import { generateImage, generateOutpaintedImage, type GeneratedImage } from "../_lib/ai.js";
+import { getCandidateScrollFilters, isStaleRunningJob } from "../_lib/generationPlan.js";
+import { getScrollImageDimensions } from "../_lib/imageDimensions.js";
+import { calculateVisibleSeamQualityScore, copyPreviousOverlapIntoNewImage, extractRightOverlapByWidth, normalizeImageBuffer } from "../_lib/stitchImages.js";
+import { createSupabaseAdmin } from "../_lib/supabaseAdmin.js";
+import { isCronRequestAuthorized } from "../_lib/cronAuth.js";
+import { buildCreativePlanPromptSection, createCreativePlan, normalizeCreativePlan } from "../../src/lib/creativePlan.js";
+import { formatUnknownError } from "../../src/lib/errorFormatting.js";
 
 const DEFAULT_MAX_CONCURRENT_JOBS = 2;
 const DEFAULT_GENERATION_TIMEOUT_MS = 12 * 60 * 1000;
@@ -183,7 +183,7 @@ async function generateOneScrollImage(supabase: SupabaseAdmin, scroll: ScrollRow
       await updateJobCreativePlan(supabase, job.id, creativePlan, now);
     }
     const prompt = buildImagePrompt(scroll, targetIndex, Boolean(previousImageBuffer), creativePlan);
-    const generated = await withGenerationTimeout(
+    const generated: GeneratedImage = await withGenerationTimeout(
       previousImageBuffer
         ? generateOutpaintedImage(prompt, previousImageBuffer, overlapRatio, referenceImageBase64, overlapWidth, height, width)
         : generateImage(prompt, referenceImageBase64),

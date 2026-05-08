@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { optimizeThemeWithDeepSeek } from "../_lib/ai";
-import { createSupabaseAdmin } from "../_lib/supabaseAdmin";
-import { createCreativePlan } from "../../src/lib/creativePlan";
+import { optimizeThemeWithDeepSeek } from "../_lib/ai.js";
+import { createSupabaseAdmin } from "../_lib/supabaseAdmin.js";
+import { createCreativePlan } from "../../src/lib/creativePlan.js";
 
 const FIXED_OVERLAP_PRESET = "maximum";
 const FIXED_OVERLAP_RATIO = 0.25;

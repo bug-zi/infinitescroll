@@ -1,5 +1,5 @@
-import { createOutpaintCanvas, createOutpaintMask } from "./stitchImages";
-import { getImageRequestTimeoutMs } from "../../src/lib/imageTimeout";
+import { createOutpaintCanvas, createOutpaintMask } from "./stitchImages.js";
+import { getImageRequestTimeoutMs } from "../../src/lib/imageTimeout.js";
 
 const deepSeekUrl = "https://api.deepseek.com/chat/completions";
 

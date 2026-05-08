@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { buildScrollUpdatePatch } from "../_lib/scrollUpdates";
-import { createSupabaseAdmin } from "../_lib/supabaseAdmin";
+import { buildScrollUpdatePatch } from "../_lib/scrollUpdates.js";
+import { createSupabaseAdmin } from "../_lib/supabaseAdmin.js";
 
 function isUuid(value: string) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);

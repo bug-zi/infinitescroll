@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { getStoragePathFromPublicUrl } from "../_lib/scrollDeletion";
-import { createSupabaseAdmin } from "../_lib/supabaseAdmin";
+import { getStoragePathFromPublicUrl } from "../_lib/scrollDeletion.js";
+import { createSupabaseAdmin } from "../_lib/supabaseAdmin.js";
 
 const IMAGE_BUCKET = "scroll-images";
 

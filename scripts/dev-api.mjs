@@ -113,7 +113,8 @@ export async function handleDevApiRequest(req, res) {
     }
 
     if (req.method === "GET" && url.pathname === "/api/system/status") {
-      json(res, 200, buildSystemStatus({ scrolls: [], images: [], jobs: [], logs: [] }));
+      const data = await loadSystemStatusData();
+      json(res, 200, buildSystemStatus(data));
       return;
     }
 

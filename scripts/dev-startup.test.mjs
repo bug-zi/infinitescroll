@@ -14,4 +14,12 @@ describe("local dev startup", () => {
     expect(viteConfig).not.toContain("5180");
     expect(viteConfig).not.toContain("http.request");
   });
+
+  it("reports live scheduler and Supabase status from the local system endpoint", () => {
+    const devApi = readFileSync("scripts/dev-api.mjs", "utf8");
+
+    expect(devApi).toContain('if (req.method === "GET" && url.pathname === "/api/system/status")');
+    expect(devApi).toContain("const data = await loadSystemStatusData()");
+    expect(devApi).toContain("json(res, 200, buildSystemStatus(data))");
+  });
 });

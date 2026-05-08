@@ -592,6 +592,19 @@ h4 {
   max-width: none;
 }
 
+.segment.true-seam .segment-image::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 1;
+  width: 2px;
+  background: rgba(184, 117, 39, 0.62);
+  box-shadow: 0 0 0 1px rgba(255, 250, 240, 0.62);
+  pointer-events: none;
+}
+
 .pending-segment {
   display: grid;
   place-items: center;
@@ -614,12 +627,11 @@ h4 {
 }
 
 .plan-track {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 18px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  align-items: stretch;
+  gap: 12px;
   margin-top: 16px;
-  overflow-x: auto;
   padding-bottom: 4px;
 }
 
@@ -639,19 +651,107 @@ h4 {
   object-fit: cover;
 }
 
+.latest-plan-item {
+  grid-column: 1 / -1;
+  grid-template-columns: minmax(120px, 180px) minmax(0, 1fr);
+  align-items: center;
+  justify-items: stretch;
+  gap: 14px;
+  padding: 10px;
+  border: 1px solid #eadfcf;
+  border-radius: 7px;
+  background: #fffdf8;
+}
+
+.latest-plan-item img {
+  width: 100%;
+  height: auto;
+  aspect-ratio: 4 / 3;
+}
+
+.latest-plan-item div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.latest-plan-item span,
+.latest-plan-item small {
+  color: #857668;
+}
+
+.latest-plan-item strong {
+  color: #34271e;
+  font-size: 16px;
+}
+
 .plan-item.next {
   border: 1px solid #ce944a;
   border-radius: 7px;
-  padding: 12px 18px;
+  padding: 14px;
   background: #fff9ee;
+}
+
+.creative-plan-card {
+  justify-items: stretch;
+  gap: 12px;
+  min-width: 0;
+  text-align: left;
+}
+
+.plan-card-head {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.plan-card-head strong,
+.plan-card-head span {
+  display: block;
+  min-width: 0;
+}
+
+.plan-card-head strong {
+  color: #34271e;
+  font-size: 14px;
+}
+
+.plan-card-head span {
+  margin-top: 4px;
+  color: #857668;
+}
+
+.creative-plan-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+
+.creative-plan-list div {
+  display: grid;
+  grid-template-columns: 68px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.creative-plan-list dt {
+  color: #9a6a2a;
+  font-weight: 700;
+}
+
+.creative-plan-list dd {
+  margin: 0;
+  color: #554a40;
+  line-height: 1.55;
 }
 
 .countdown-ring {
   display: grid;
   place-items: center;
-  width: 72px;
-  height: 72px;
-  border: 6px solid #e1d7c9;
+  width: 54px;
+  height: 54px;
+  border: 5px solid #e1d7c9;
   border-top-color: #9a6a2a;
   border-radius: 99px;
   padding: 0 8px;
@@ -701,6 +801,23 @@ h4 {
   padding-bottom: 12px;
 }
 
+.logs-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.logs-panel-header h3 {
+  margin: 0;
+}
+
+.logs-more-button {
+  min-height: 32px;
+  white-space: nowrap;
+}
+
 .log-row {
   display: grid;
   grid-template-columns: 20px 150px minmax(0, 1fr) 58px;
@@ -740,6 +857,45 @@ h4 {
 .log-row time {
   color: #7d7368;
   text-align: right;
+}
+
+.log-groups-page {
+  align-content: start;
+}
+
+.log-groups {
+  display: grid;
+  gap: 16px;
+}
+
+.log-group {
+  display: grid;
+  gap: 10px;
+}
+
+.log-group-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid #eee4d9;
+  padding-bottom: 10px;
+}
+
+.log-group-header h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.log-group-header p {
+  margin: 4px 0 0;
+  color: #857668;
+  font-size: 13px;
+}
+
+.log-group-list {
+  display: grid;
+  gap: 4px;
 }
 
 .full-width-button {
@@ -845,6 +1001,37 @@ h4 {
 .meta-list dt,
 .meta-list dd {
   margin: 0;
+}
+
+.meta-list dd {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.prompt-details {
+  margin-top: 10px;
+  border: 1px solid #eee4d9;
+  border-radius: 6px;
+  background: #fffdf9;
+  color: #6a6056;
+  font-size: 12px;
+}
+
+.prompt-details summary {
+  cursor: pointer;
+  padding: 8px 10px;
+  color: #3f352c;
+  font-weight: 700;
+}
+
+.prompt-details p {
+  max-height: 220px;
+  overflow: auto;
+  margin: 0;
+  padding: 0 10px 10px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.55;
 }
 
 .stitch-preview {
@@ -1166,8 +1353,6 @@ h4 {
   position: absolute;
   top: 50%;
   left: 50%;
-  display: flex;
-  align-items: stretch;
   overflow: hidden;
   border-radius: 5px;
   background: #efe5d6;
@@ -1179,8 +1364,8 @@ h4 {
 }
 
 .panorama-segment {
-  position: relative;
-  flex: 0 0 auto;
+  position: absolute;
+  top: 0;
   overflow: hidden;
   background: #eadfce;
 }

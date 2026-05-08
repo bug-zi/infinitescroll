@@ -1,6 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { optimizeThemeWithDeepSeek } from "../_lib/ai";
 import { createSupabaseAdmin } from "../_lib/supabaseAdmin";
+import { createCreativePlan } from "../../src/lib/creativePlan";
 
 const FIXED_OVERLAP_PRESET = "maximum";
 const FIXED_OVERLAP_RATIO = 0.25;
@@ -44,12 +45,15 @@ export default async function handler(request: VercelRequest, response: VercelRe
 
     if (scrollError) throw scrollError;
 
-    const { error: jobError } = await supabase.from("generation_jobs").insert({
-      scroll_id: scroll.id,
-      target_index: 1,
-      type: "auto_next",
-      status: "queued",
-      scheduled_for: nextRunAt,
+    const { error: jobError } = await insertInitialJob(supabase, {
+      scrollId: scroll.id,
+      scheduledFor: nextRunAt,
+      creativePlan: createCreativePlan({
+        theme,
+        optimizedPrompt,
+        targetIndex: 1,
+        hasReferenceImage: false,
+      }),
     });
 
     if (jobError) throw jobError;
@@ -67,4 +71,34 @@ export default async function handler(request: VercelRequest, response: VercelRe
       error: error instanceof Error ? error.message : "Create scroll failed",
     });
   }
+}
+
+function isMissingCreativePlanColumn(error: unknown) {
+  if (!error || typeof error !== "object") return false;
+  const record = error as { code?: unknown; message?: unknown };
+  const message = String(record.message ?? "").toLowerCase();
+  return String(record.code ?? "") === "PGRST204" || (message.includes("creative_plan") && message.includes("column"));
+}
+
+async function insertInitialJob(
+  supabase: ReturnType<typeof createSupabaseAdmin>,
+  input: { scrollId: string; scheduledFor: string; creativePlan: unknown },
+) {
+  const { error } = await supabase.from("generation_jobs").insert({
+    scroll_id: input.scrollId,
+    target_index: 1,
+    type: "auto_next",
+    status: "queued",
+    scheduled_for: input.scheduledFor,
+    creative_plan: input.creativePlan,
+  });
+  if (!error) return { error: null };
+  if (!isMissingCreativePlanColumn(error)) return { error };
+  return supabase.from("generation_jobs").insert({
+    scroll_id: input.scrollId,
+    target_index: 1,
+    type: "auto_next",
+    status: "queued",
+    scheduled_for: input.scheduledFor,
+  });
 }

@@ -1,4 +1,5 @@
-import type { GenerationJob, Scroll } from "../types";
+import type { CreativePlan, GenerationJob, Scroll } from "../types";
+import { createCreativePlan } from "./creativePlan";
 
 export function formatClock(iso: string) {
   return new Intl.DateTimeFormat("zh-CN", {
@@ -50,21 +51,43 @@ export type GenerationPlanItem = {
   targetIndex: number;
   scheduledFor: string;
   label: { text: string; tone: CountdownTone };
+  creativePlan: CreativePlan;
   source: "job" | "scroll";
 };
 
 export function getGenerationPlanItems(jobs: GenerationJob[], scroll: Scroll | undefined, now = new Date()): GenerationPlanItem[] {
-  if (jobs.length) {
-    return jobs.slice(0, 5).map((job) => ({
+  const nextTargetIndex = scroll ? scroll.imageCount + 1 : undefined;
+  const actionableJobs = jobs
+    .filter((job) => {
+      if (job.status === "succeeded" || job.status === "cancelled" || job.status === "failed") return false;
+      if (!scroll) return true;
+      return job.targetIndex >= nextTargetIndex! || job.status === "running";
+    })
+    .sort((a, b) => {
+      if (a.status === "running" && b.status !== "running") return -1;
+      if (a.status !== "running" && b.status === "running") return 1;
+      return new Date(a.scheduledFor).getTime() - new Date(b.scheduledFor).getTime();
+    });
+
+  if (actionableJobs.length) {
+    return actionableJobs.slice(0, 2).map((job) => ({
       id: job.id,
       targetIndex: job.targetIndex,
       scheduledFor: job.scheduledFor,
       label: getGenerationCountdownLabel(job, now),
+      creativePlan:
+        job.creativePlan ??
+        createCreativePlan({
+          theme: scroll?.originalTheme,
+          optimizedPrompt: scroll?.optimizedPrompt,
+          targetIndex: job.targetIndex,
+          hasReferenceImage: job.targetIndex > 1,
+        }),
       source: "job",
     }));
   }
 
-  if (!scroll?.autoGenerationEnabled) return [];
+  if (!scroll) return [];
 
   const countdown = getCountdownParts(scroll.nextRunAt, now);
   return [
@@ -72,7 +95,17 @@ export function getGenerationPlanItems(jobs: GenerationJob[], scroll: Scroll | u
       id: `${scroll.id}-next-run`,
       targetIndex: scroll.imageCount + 1,
       scheduledFor: scroll.nextRunAt,
-      label: countdown.isDue ? { text: "待触发", tone: "due" } : { text: countdown.label, tone: "counting" },
+      label: !scroll.autoGenerationEnabled
+        ? { text: "已暂停", tone: "neutral" }
+        : countdown.isDue
+          ? { text: "待触发", tone: "due" }
+          : { text: countdown.label, tone: "counting" },
+      creativePlan: createCreativePlan({
+        theme: scroll.originalTheme,
+        optimizedPrompt: scroll.optimizedPrompt,
+        targetIndex: scroll.imageCount + 1,
+        hasReferenceImage: scroll.imageCount > 0,
+      }),
       source: "scroll",
     },
   ];

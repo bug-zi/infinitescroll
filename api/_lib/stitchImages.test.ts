@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import sharp from "sharp";
-import { copyPreviousOverlapIntoNewImage, createOutpaintCanvas, extractRightOverlapByWidth } from "./stitchImages";
+import { calculateVisibleSeamQualityScore, copyPreviousOverlapIntoNewImage, createOutpaintCanvas, extractRightOverlapByWidth } from "./stitchImages";
 
 async function solidPng(width: number, height: number, color: { r: number; g: number; b: number }) {
   return sharp({
@@ -120,6 +120,57 @@ describe("server image stitching", () => {
     expect(metadata.width).toBe(1920);
     expect(metadata.height).toBe(1152);
     expect(Buffer.compare(previousRight, newLeft)).toBe(0);
+  });
+
+  it("feathers the handoff after the copied overlap to avoid a hard visible seam", async () => {
+    const previous = await sharp({
+      create: {
+        width: 1536,
+        height: 1152,
+        channels: 3,
+        background: { r: 240, g: 40, b: 20 },
+      },
+    })
+      .png()
+      .toBuffer();
+    const generated = await solidPng(1920, 1152, { r: 20, g: 90, b: 220 });
+
+    const stitched = await copyPreviousOverlapIntoNewImage(generated, previous, {
+      width: 1920,
+      overlapWidth: 384,
+      height: 1152,
+      overlapRatio: 0.25,
+      featherWidth: 96,
+    });
+
+    const overlapPixel = await sharp(stitched).extract({ left: 383, top: 0, width: 1, height: 1 }).removeAlpha().raw().toBuffer();
+    const featherPixel = await sharp(stitched).extract({ left: 384, top: 0, width: 1, height: 1 }).removeAlpha().raw().toBuffer();
+    const newPixel = await sharp(stitched).extract({ left: 480, top: 0, width: 1, height: 1 }).removeAlpha().raw().toBuffer();
+
+    expect(Array.from(overlapPixel)).toEqual([240, 40, 20]);
+    expect(Array.from(featherPixel)[0]).toBeGreaterThan(20);
+    expect(Array.from(featherPixel)[0]).toBeLessThan(240);
+    expect(Array.from(newPixel)).toEqual([20, 90, 220]);
+  });
+
+  it("scores the real visible seam instead of the copied overlap area", async () => {
+    const previous = await solidPng(1536, 1152, { r: 240, g: 40, b: 20 });
+    const generated = await solidPng(1920, 1152, { r: 20, g: 90, b: 220 });
+
+    const stitched = await copyPreviousOverlapIntoNewImage(generated, previous, {
+      width: 1920,
+      overlapWidth: 384,
+      height: 1152,
+      overlapRatio: 0.25,
+    });
+
+    const score = await calculateVisibleSeamQualityScore(stitched, {
+      seamX: 384,
+      height: 1152,
+      bandWidth: 48,
+    });
+
+    expect(score).toBeLessThan(70);
   });
 
   it("does not crop the outpaint result when resizing it to the saved segment size", async () => {

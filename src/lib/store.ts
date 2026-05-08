@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { mockImages, mockJobs, mockLogs, mockScrolls, mockSystemStatus } from "../data/mockData";
+import { createCreativePlan } from "./creativePlan";
 import { FIXED_OVERLAP_PRESET, FIXED_OVERLAP_RATIO } from "./stitching";
 import { planImageDeletion, shouldRegenerateImmediately } from "./imageOperations";
 import { chooseScrollAfterDeletion } from "./scrollManagement";
+import { deriveSystemStatus } from "./systemStatus";
 import { isSupabaseConfigured, supabase } from "./supabaseClient";
 import { mapImageRow, mapJobRow, mapLogRow, mapScrollRow } from "./supabaseMappers";
 import type { GenerationJob, GenerationLog, Scroll, ScrollImage, SystemStatus } from "../types";
@@ -25,9 +27,12 @@ type BootstrapResponse = {
 };
 
 type SystemStatusResponse = Partial<SystemStatus> & {
+  serviceRunning?: boolean;
   failedJobs?: number;
   activeScrolls?: number;
 };
+
+const BOOTSTRAP_CACHE_KEY = "infinite-scroll:bootstrap-data:v1";
 
 function localLog(scrollId: string, message: string, detail: string, level: GenerationLog["level"] = "info"): GenerationLog {
   return {
@@ -40,6 +45,33 @@ function localLog(scrollId: string, message: string, detail: string, level: Gene
   };
 }
 
+function readBootstrapCache(): BootstrapResponse | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.sessionStorage.getItem(BOOTSTRAP_CACHE_KEY);
+    if (!raw) return null;
+    const value = JSON.parse(raw) as Partial<BootstrapResponse>;
+    if (!Array.isArray(value.scrolls) || !Array.isArray(value.images) || !Array.isArray(value.jobs) || !Array.isArray(value.logs)) return null;
+    return {
+      scrolls: value.scrolls,
+      images: value.images,
+      jobs: value.jobs,
+      logs: value.logs,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeBootstrapCache(payload: BootstrapResponse) {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(BOOTSTRAP_CACHE_KEY, JSON.stringify(payload));
+  } catch {
+    // Cache is a startup optimization only.
+  }
+}
+
 export function useInfiniteScrollStore() {
   const useMockInitialState = !isSupabaseConfigured;
   const [scrolls, setScrolls] = useState<Scroll[]>(useMockInitialState ? mockScrolls : []);
@@ -47,6 +79,11 @@ export function useInfiniteScrollStore() {
   const [jobs, setJobs] = useState<GenerationJob[]>(useMockInitialState ? mockJobs : []);
   const [logs, setLogs] = useState<GenerationLog[]>(useMockInitialState ? mockLogs : []);
   const [systemStatus, setSystemStatus] = useState<SystemStatus>(mockSystemStatus);
+  const [serviceStatus, setServiceStatus] = useState<Pick<SystemStatus, "serviceRunning" | "maxConcurrentJobs" | "statusError">>({
+    serviceRunning: mockSystemStatus.serviceRunning,
+    maxConcurrentJobs: mockSystemStatus.maxConcurrentJobs,
+    statusError: mockSystemStatus.statusError,
+  });
   const [selectedScrollId, setSelectedScrollId] = useState(useMockInitialState ? mockScrolls[0].id : "");
   const [selectedImageId, setSelectedImageId] = useState(useMockInitialState ? mockImages[0].id : "");
   const [dataMode, setDataMode] = useState<DataMode>(isSupabaseConfigured ? "loading" : "mock");
@@ -58,6 +95,7 @@ export function useInfiniteScrollStore() {
       const response = await fetch("/api/bootstrap/data");
       if (response.ok) {
         const payload = (await response.json()) as BootstrapResponse;
+        writeBootstrapCache(payload);
         applyRemoteData(payload.scrolls, payload.images, payload.jobs, payload.logs, keepSelection);
         void loadSystemStatus();
         return;
@@ -99,15 +137,10 @@ export function useInfiniteScrollStore() {
       const response = await fetch("/api/system/status");
       if (!response.ok) return;
       const payload = (await response.json()) as SystemStatusResponse;
-      setSystemStatus((current) => ({
-        ...current,
-        cronRunning: Boolean(payload.cronRunning),
-        nextGlobalRunLabel: payload.nextGlobalRunLabel ?? current.nextGlobalRunLabel,
-        generatedToday: Number(payload.generatedToday ?? current.generatedToday),
-        totalGenerated: Number(payload.totalGenerated ?? current.totalGenerated),
-        apiHealthPercent: Number(payload.apiHealthPercent ?? current.apiHealthPercent),
-        activeConcurrentJobs: Number(payload.activeConcurrentJobs ?? current.activeConcurrentJobs),
+      setServiceStatus((current) => ({
+        serviceRunning: Boolean(payload.serviceRunning ?? payload.cronRunning ?? current.serviceRunning),
         maxConcurrentJobs: Number(payload.maxConcurrentJobs ?? current.maxConcurrentJobs),
+        statusError: typeof payload.statusError === "string" ? payload.statusError : payload.statusError === null ? null : current.statusError,
       }));
     } catch {
       // Status is informative; data loading should not fail because of it.
@@ -147,6 +180,15 @@ export function useInfiniteScrollStore() {
   }
 
   useEffect(() => {
+    setSystemStatus(deriveSystemStatus(scrolls, images, jobs, serviceStatus));
+  }, [scrolls, images, jobs, serviceStatus]);
+
+  useEffect(() => {
+    const cached = readBootstrapCache();
+    if (cached) {
+      applyRemoteData(cached.scrolls, cached.images, cached.jobs, cached.logs, false);
+      setDataMessage("已显示上次同步的数据，正在后台刷新 Supabase...");
+    }
     void loadRemoteData(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -158,7 +200,7 @@ export function useInfiniteScrollStore() {
   );
   const selectedImage = scrollImages.find((image) => image.id === selectedImageId) ?? scrollImages[0];
   const scrollJobs = selectedScroll ? jobs.filter((job) => job.scrollId === selectedScroll.id).sort((a, b) => a.targetIndex - b.targetIndex) : [];
-  const scrollLogs = selectedScroll ? logs.filter((log) => log.scrollId === selectedScroll.id).slice(0, 8) : [];
+  const scrollLogs = selectedScroll ? logs.filter((log) => log.scrollId === selectedScroll.id) : [];
 
   async function addLog(message: string, detail: string, level: GenerationLog["level"] = "info", scrollId = selectedScroll?.id ?? "") {
     if (!scrollId) return;
@@ -272,6 +314,12 @@ export function useInfiniteScrollStore() {
         type: "auto_next",
         status: "queued",
         scheduled_for: nextRunAt,
+        creative_plan: createCreativePlan({
+          theme: cleanTheme,
+          optimizedPrompt,
+          targetIndex: 1,
+          hasReferenceImage: false,
+        }),
       });
       await addLog("画卷已创建", "第一张图片任务已进入队列", "success", data.id);
       await loadRemoteData(false);
@@ -400,6 +448,7 @@ export function useInfiniteScrollStore() {
       const response = await fetch("/api/bootstrap/data");
       if (!response.ok) continue;
       const payload = (await response.json()) as BootstrapResponse;
+      writeBootstrapCache(payload);
       applyRemoteData(payload.scrolls, payload.images, payload.jobs, payload.logs, true);
       const currentCount = payload.images.filter((image) => image.scroll_id === selectedScroll.id).length;
       if (currentCount > previousImageCount) {

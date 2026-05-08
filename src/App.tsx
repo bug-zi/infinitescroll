@@ -21,7 +21,9 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { confirmAction } from "./lib/confirmAction";
-import { clampScale, computeInitialPan, computePanForHeldDirection, computeSegmentLayout, computeZoomAroundPoint } from "./lib/panoramaViewer";
+import { DEFAULT_LOG_PREVIEW_LIMIT, getRecentLogs, groupLogsByScroll } from "./lib/logViews";
+import { clampScale, computeInitialPan, computePanForHeldDirection, computeSegmentLayout, computeVisibleImageLayout, computeZoomAroundPoint } from "./lib/panoramaViewer";
+import { summarizePrompt } from "./lib/promptDisplay";
 import { FIXED_OVERLAP_RATIO } from "./lib/stitching";
 import { formatStitchScore } from "./lib/stitchQuality";
 import { formatClock, formatDateMinute, getCountdownParts, getGenerationPlanItems } from "./lib/time";
@@ -34,7 +36,7 @@ const statusText: Record<Scroll["status"], string> = {
   complete: "已完成",
 };
 
-type View = "workspace" | "console" | "settings";
+type View = "workspace" | "console" | "logs" | "settings";
 
 export function App() {
   const store = useInfiniteScrollStore();
@@ -80,7 +82,7 @@ export function App() {
                 onOpen={(image) => setViewerInitialImageId(image.id)}
               />
               <GenerationPlan scroll={store.selectedScroll} jobs={store.jobs} images={store.images} />
-              <LogPanel logs={store.logs} />
+              <LogPanel logs={store.logs} onViewMore={() => setView("logs")} />
             </div>
             <Inspector
               image={store.selectedImage}
@@ -114,6 +116,16 @@ export function App() {
             jobs={store.allJobs}
             logs={store.allLogs}
             onRetryJob={store.retryJob}
+            onSelectScroll={(id) => {
+              store.selectScroll(id);
+              setView("workspace");
+            }}
+          />
+        )}
+        {view === "logs" && (
+          <LogsPage
+            scrolls={store.scrolls}
+            logs={store.allLogs}
             onSelectScroll={(id) => {
               store.selectScroll(id);
               setView("workspace");
@@ -185,6 +197,9 @@ function Sidebar({
         </button>
         <button className={`nav-item ${view === "console" ? "active" : ""}`} onClick={() => onView("console")}>
           <Gauge size={17} /> 控制台
+        </button>
+        <button className={`nav-item ${view === "logs" ? "active" : ""}`} onClick={() => onView("logs")}>
+          <List size={17} /> 日志记录
         </button>
         <button className={`nav-item ${view === "settings" ? "active" : ""}`} onClick={() => onView("settings")}>
           <Settings size={17} /> 设置
@@ -314,35 +329,37 @@ function ScrollPreview({ images, selectedImageId, onSelect, onOpen }: { images: 
       <div className="section-title"><h3>画卷预览（共 {images.length} 张）</h3></div>
       <div className="canvas-shell">
         <div className="canvas-track">
-          {images.map((image, index) => (
-            <button
-              key={image.id}
-              className={`segment ${image.id === selectedImageId ? "selected" : ""} ${image.hasStitchWarning ? "warning" : ""}`}
-              style={{
-                width: `${Math.max(72, Math.round((image.dimensions.width / image.dimensions.height) * segmentHeight))}px`,
-                marginLeft: index === 0 ? 0 : `-${Math.round((image.overlapCrop.width / image.dimensions.height) * segmentHeight)}px`,
-              }}
-              onClick={() => {
-                onSelect(image.id);
-                onOpen(image);
-              }}
-            >
-              <div className="segment-label">
-                <strong>{image.index}</strong>
-                <span>{image.dimensions.ratioLabel}</span>
-              </div>
-              <div className="segment-image">
-                <img
-                  src={image.src}
-                  alt={image.title}
-                  style={{
-                    height: segmentHeight,
-                    width: Math.round((image.dimensions.width / image.dimensions.height) * segmentHeight),
-                  }}
-                />
-              </div>
-            </button>
-          ))}
+          {images.map((image) => {
+            const crop = computeVisibleImageLayout(image, segmentHeight);
+            return (
+              <button
+                key={image.id}
+                className={`segment ${image.id === selectedImageId ? "selected" : ""} ${image.hasStitchWarning ? "warning" : ""} ${crop.overlapLeft > 0 ? "true-seam" : ""}`}
+                style={{ width: `${Math.max(72, crop.width)}px` }}
+                title={crop.overlapLeft > 0 ? "真实衔接位置" : image.title}
+                onClick={() => {
+                  onSelect(image.id);
+                  onOpen(image);
+                }}
+              >
+                <div className="segment-label">
+                  <strong>{image.index}</strong>
+                  <span>{image.dimensions.ratioLabel}</span>
+                </div>
+                <div className="segment-image">
+                  <img
+                    src={image.src}
+                    alt={image.title}
+                    style={{
+                      height: segmentHeight,
+                      width: crop.imageWidth,
+                      transform: `translateX(-${crop.imageOffsetLeft}px)`,
+                    }}
+                  />
+                </div>
+              </button>
+            );
+          })}
           <div className="pending-segment"><strong>{images.length + 1}</strong><span>待生成</span></div>
         </div>
       </div>
@@ -350,37 +367,56 @@ function ScrollPreview({ images, selectedImageId, onSelect, onOpen }: { images: 
   );
 }
 
-function GenerationPlan({ scroll, jobs, images }: { scroll?: Scroll; jobs: GenerationJob[]; images: ScrollImage[] }) {
+export function GenerationPlan({ scroll, jobs, images }: { scroll?: Scroll; jobs: GenerationJob[]; images: ScrollImage[] }) {
   const items = getGenerationPlanItems(jobs, scroll);
   return (
     <section className="panel">
       <h3>生成计划</h3>
       <div className="plan-track">
         {images.slice(-1).map((image) => (
-          <div key={image.id} className="plan-item">
+          <div key={image.id} className="plan-item latest-plan-item">
             <img src={image.src} alt="" />
-            <strong>第 {image.index} 张</strong>
-            <span>最新生成</span>
+            <div>
+              <span>最新生成</span>
+              <strong>第 {image.index} 张</strong>
+              <small>{formatDateMinute(image.generatedAt)}</small>
+            </div>
           </div>
         ))}
         {items.map((item) => (
-          <div key={item.id} className="plan-item next">
-            <div className={`countdown-ring ${item.label.tone}`}>{item.label.text}</div>
-            <strong>第 {item.targetIndex} 张</strong>
-            <span>{formatDateMinute(item.scheduledFor)}</span>
+          <div key={item.id} className="plan-item next creative-plan-card">
+            <div className="plan-card-head">
+              <div className={`countdown-ring ${item.label.tone}`}>{item.label.text}</div>
+              <div>
+                <strong>{item.creativePlan.title}</strong>
+                <span>第 {item.targetIndex} 张 / {formatDateMinute(item.scheduledFor)}</span>
+              </div>
+            </div>
+            <dl className="creative-plan-list">
+              <div><dt>衔接锚点</dt><dd>{item.creativePlan.continuityAnchor}</dd></div>
+              <div><dt>新增画面</dt><dd>{item.creativePlan.newScene}</dd></div>
+              <div><dt>构图节奏</dt><dd>{item.creativePlan.composition}</dd></div>
+              <div><dt>禁止偏移</dt><dd>{item.creativePlan.forbidden}</dd></div>
+              <div><dt>提示词片段</dt><dd>直接写入图片生成提示词</dd></div>
+            </dl>
           </div>
         ))}
       </div>
-      <p className="hint">AI 会按画卷节奏生成；失败任务可在控制台重试。</p>
+      <p className="hint">失败记录已收纳到控制台；这里仅展示最新图片和下一步生成计划。</p>
     </section>
   );
 }
+function LogPanel({ logs, onViewMore }: { logs: GenerationLog[]; onViewMore: () => void }) {
+  const recentLogs = getRecentLogs(logs);
+  const hasMoreLogs = logs.length > DEFAULT_LOG_PREVIEW_LIMIT;
 
-function LogPanel({ logs }: { logs: GenerationLog[] }) {
   return (
     <section className="panel logs-panel">
-      <h3>生成日志</h3>
-      {logs.length ? logs.map((log) => <LogRow key={log.id} log={log} />) : <p className="hint">暂无日志。</p>}
+      <div className="logs-panel-header">
+        <h3>生成日志</h3>
+        {hasMoreLogs && <button className="small-button logs-more-button" onClick={onViewMore}>查看更多</button>}
+      </div>
+      {recentLogs.length ? recentLogs.map((log) => <LogRow key={log.id} log={log} />) : <p className="hint">暂无日志。</p>}
     </section>
   );
 }
@@ -413,6 +449,8 @@ function Inspector({
 }) {
   if (!image) return <aside className="inspector"><div className="panel empty-inspector">当前画卷还没有图片。</div></aside>;
 
+  const promptSummary = summarizePrompt(image.prompt);
+
   return (
     <aside className="inspector">
       <section className="panel detail-panel">
@@ -438,8 +476,12 @@ function Inspector({
           <div><dt>文件大小：</dt><dd>{image.fileSize}</dd></div>
           <div><dt>生成模型：</dt><dd>{image.model}</dd></div>
           <div><dt>衔接评分：</dt><dd>{formatStitchScore(image.stitchQualityScore)}</dd></div>
-          <div><dt>提示词：</dt><dd>{image.prompt}</dd></div>
+          <div><dt>生成摘要：</dt><dd>{promptSummary}</dd></div>
         </dl>
+        <details className="prompt-details">
+          <summary>查看完整提示词</summary>
+          <p>{image.prompt || "暂无提示词"}</p>
+        </details>
         <h4>衔接信息</h4>
         <div className="stitch-preview">
           <div><span>重叠区域</span><div className="mini-stitch overlap" style={{ backgroundImage: `url(${image.src})` }} /></div>
@@ -448,13 +490,15 @@ function Inspector({
       </section>
       <section className="panel status-panel">
         <h3>系统状态</h3>
-        <StatusLine label="自动生成服务" value={systemStatus.cronRunning ? "运行中" : "已暂停"} good={systemStatus.cronRunning} />
-        <StatusLine label="下次生成时间" value={systemStatus.nextGlobalRunLabel} />
+        <StatusLine label="本地调度服务" value={systemStatus.serviceRunning ? "运行中" : "未运行"} good={systemStatus.serviceRunning} />
+        <StatusLine label="已开启画卷" value={`${systemStatus.activeScrolls} 个`} good={systemStatus.autoGenerationEnabled} />
+        <StatusLine label="下次自动生成" value={systemStatus.nextGlobalRunLabel} />
         <StatusLine label="今日已生成" value={`${systemStatus.generatedToday} 张`} />
         <StatusLine label="总生成数量" value={`${systemStatus.totalGenerated} 张`} />
         <StatusLine label="并发任务" value={`${systemStatus.activeConcurrentJobs}/${systemStatus.maxConcurrentJobs}`} />
+        <StatusLine label="失败任务" value={`${systemStatus.failedJobs} 个`} good={systemStatus.failedJobs === 0} />
         <div className="health-bar"><span style={{ width: `${systemStatus.apiHealthPercent}%` }} /></div>
-        <p>API 调用健康度 {systemStatus.apiHealthPercent}%</p>
+        <p>{systemStatus.statusError ? `状态接口异常：${systemStatus.statusError}` : `API 调用健康度 ${systemStatus.apiHealthPercent}%`}</p>
       </section>
     </aside>
   );
@@ -559,6 +603,49 @@ function Metric({ label, value }: { label: string; value: string }) {
 
 function QueueSummary({ label, value, danger }: { label: string; value: string | number; danger?: boolean }) {
   return <div className={`queue-summary ${danger ? "danger" : ""}`}><span>{label}</span><strong>{value}</strong></div>;
+}
+
+function LogsPage({ scrolls, logs, onSelectScroll }: { scrolls: Scroll[]; logs: GenerationLog[]; onSelectScroll: (id: string) => void }) {
+  const groups = groupLogsByScroll(logs, scrolls);
+
+  return (
+    <main className="console-page log-groups-page">
+      <section className="console-hero panel">
+        <div>
+          <h2>日志记录</h2>
+          <p>按画卷归档完整生成日志，工作台只保留最近 10 条摘要。</p>
+        </div>
+        <div className="console-metrics">
+          <Metric label="日志总数" value={`${logs.length}`} />
+          <Metric label="画卷分组" value={`${groups.length}`} />
+          <Metric label="已有画卷" value={`${scrolls.length}`} />
+          <Metric label="预览条数" value={`${DEFAULT_LOG_PREVIEW_LIMIT}`} />
+        </div>
+      </section>
+      <section className="log-groups">
+        {groups.length ? (
+          groups.map((group) => (
+            <article key={group.scrollId} className="panel log-group">
+              <div className="log-group-header">
+                <div>
+                  <h3>{group.title}</h3>
+                  <p>{group.logs.length} 条日志</p>
+                </div>
+                {group.scroll && <button className="small-button" onClick={() => onSelectScroll(group.scrollId)}>打开画卷</button>}
+              </div>
+              <div className="log-group-list">
+                {group.logs.map((log) => <LogRow key={log.id} log={log} />)}
+              </div>
+            </article>
+          ))
+        ) : (
+          <section className="panel">
+            <p className="hint">暂无日志。</p>
+          </section>
+        )}
+      </section>
+    </main>
+  );
 }
 
 function SettingsPage() {
@@ -776,15 +863,17 @@ function ScrollPanoramaViewer({
             transform: `translate(calc(-50% + ${pan.x}px), calc(-50% + ${pan.y}px)) scale(${scale})`,
           }}
         >
-          {images.map((image) => {
+          {images.map((image, index) => {
             const segment = layout.segments.find((item) => item.id === image.id);
             if (!segment) return null;
+            const seamOverlap = index === 0 ? 0 : 1;
             return (
               <div
                 key={image.id}
                 className="panorama-segment"
                 style={{
-                  width: `${segment.width}px`,
+                  left: `${segment.left - seamOverlap}px`,
+                  width: `${segment.width + seamOverlap}px`,
                   height: `${segment.height}px`,
                 }}
               >
@@ -793,7 +882,7 @@ function ScrollPanoramaViewer({
                   alt=""
                   draggable={false}
                   style={{
-                    width: `${segment.imageWidth}px`,
+                    width: `${segment.imageWidth + seamOverlap}px`,
                     height: "100%",
                     objectFit: "fill",
                     transform: `translateX(-${segment.imageOffsetLeft}px)`,

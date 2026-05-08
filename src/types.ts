@@ -8,6 +8,15 @@ export type JobType = "auto_next" | "regenerate" | "insert_before" | "insert_aft
 
 export type OverlapPreset = "standard" | "strong" | "maximum";
 
+export interface CreativePlan {
+  title: string;
+  continuityAnchor: string;
+  newScene: string;
+  composition: string;
+  forbidden: string;
+  promptFragment: string;
+}
+
 export interface CropRegion {
   x: number;
   y: number;
@@ -62,6 +71,7 @@ export interface GenerationJob {
   type: JobType;
   status: JobStatus;
   scheduledFor: string;
+  creativePlan?: CreativePlan;
   errorMessage?: string;
 }
 
@@ -76,10 +86,15 @@ export interface GenerationLog {
 
 export interface SystemStatus {
   cronRunning: boolean;
+  serviceRunning: boolean;
+  autoGenerationEnabled: boolean;
   nextGlobalRunLabel: string;
   generatedToday: number;
   totalGenerated: number;
   apiHealthPercent: number;
   activeConcurrentJobs: number;
   maxConcurrentJobs: number;
+  failedJobs: number;
+  activeScrolls: number;
+  statusError: string | null;
 }

@@ -1,4 +1,5 @@
 import { createOutpaintCanvas, createOutpaintMask } from "./stitchImages";
+import { getImageRequestTimeoutMs } from "../../src/lib/imageTimeout";
 
 const deepSeekUrl = "https://api.deepseek.com/chat/completions";
 
@@ -63,9 +64,9 @@ export function fallbackOptimizedPrompt(theme: string) {
 }
 
 export async function generateImage(prompt: string, referenceImageBase64?: string): Promise<GeneratedImage> {
-  const key = process.env.OPENAI_API_KEY;
   const model = process.env.OPENAI_IMAGE_MODEL ?? "gpt-5";
-  if (!key) return fallbackImage(prompt, "Mock GPT Image");
+  const keys = getOpenAIKeyPool();
+  if (!keys.length) return fallbackImage(prompt, "Mock GPT Image");
 
   const baseUrl = (process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/$/, "");
   const endpoint = baseUrl.endsWith("/v1") ? `${baseUrl}/responses` : `${baseUrl}/v1/responses`;
@@ -82,7 +83,9 @@ export async function generateImage(prompt: string, referenceImageBase64?: strin
     });
   }
 
-  try {
+  for (const key of keys) {
+    const keyLabel = getOpenAIKeyLabel(key);
+    try {
     const response = await fetch(endpoint, {
       method: "POST",
       headers: {
@@ -103,25 +106,26 @@ export async function generateImage(prompt: string, referenceImageBase64?: strin
 
     if (!response.ok) {
       const detail = await response.text();
-      console.warn(`Image provider failed: ${response.status} ${detail}`);
-      return fallbackImage(prompt, model);
+      console.warn(`Image provider ${keyLabel} failed: ${response.status} ${detail}`);
+      continue;
     }
 
     const data = (await response.json()) as ResponsesApiOutput;
     const base64 = data.output?.find((item) => item.type === "image_generation_call")?.result;
-    if (!base64) return fallbackImage(prompt, model);
+    if (!base64) continue;
 
     return {
       imageUrl: `data:image/png;base64,${base64}`,
       imageBytes: Uint8Array.from(Buffer.from(base64, "base64")),
       mimeType: "image/png",
-      model,
+      model: `${model} (${keyLabel})`,
       prompt,
     };
-  } catch (error) {
-    console.warn(error);
-    return fallbackImage(prompt, model);
+    } catch (error) {
+      console.warn(`Image provider ${keyLabel} threw`, error);
+    }
   }
+  return fallbackImage(prompt, model);
 }
 
 export async function generateOutpaintedImage(
@@ -151,8 +155,8 @@ async function tryImageEditOutpaint(
   sourceHeight = 768,
   sourceWidth?: number,
 ): Promise<GeneratedImage | null> {
-  const key = process.env.OPENAI_API_KEY;
-  if (!key) return null;
+  const keys = getOpenAIKeyPool();
+  if (!keys.length) return null;
 
   const baseUrl = (process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/$/, "");
   const v1 = baseUrl.endsWith("/v1") ? baseUrl : `${baseUrl}/v1`;
@@ -163,10 +167,10 @@ async function tryImageEditOutpaint(
   const overlapWidth = sourceOverlapWidth ?? Math.max(1, Math.round((editWidth / (1 + overlapRatio)) * overlapRatio));
   const canvas = await createOutpaintCanvas(previousImageBuffer, editWidth, editHeight, overlapWidth, sourceOverlapWidth ?? overlapWidth, sourceHeight);
   const mask = await createOutpaintMask(editWidth, editHeight, overlapWidth);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 300000);
-
-  try {
+  for (const key of keys) {
+    const keyLabel = getOpenAIKeyLabel(key);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), getImageRequestTimeoutMs());
     const form = new FormData();
     form.append("model", model);
     form.append("prompt", prompt);
@@ -178,38 +182,40 @@ async function tryImageEditOutpaint(
     form.append("image[]", new Blob([new Uint8Array(previousImageBuffer)], { type: "image/png" }), "previous.png");
     form.append("mask", new Blob([new Uint8Array(mask)], { type: "image/png" }), "mask.png");
 
-    const response = await fetch(endpoint, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${key}`,
-      },
-      body: form,
-    });
+    try {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${key}`,
+        },
+        body: form,
+      });
 
-    if (!response.ok) {
-      const detail = await response.text();
-      console.warn(`Image edit provider failed: ${response.status} ${detail}`);
-      return null;
+      if (!response.ok) {
+        const detail = await response.text();
+        console.warn(`Image edit provider ${keyLabel} failed: ${response.status} ${detail}`);
+        continue;
+      }
+
+      const data = (await response.json()) as { data?: Array<{ b64_json?: string }> };
+      const base64 = data.data?.[0]?.b64_json;
+      if (!base64) continue;
+
+      return {
+        imageUrl: `data:image/png;base64,${base64}`,
+        imageBytes: Uint8Array.from(Buffer.from(base64, "base64")),
+        mimeType: "image/png",
+        model: `${model} edit-outpaint (${keyLabel})`,
+        prompt,
+      };
+    } catch (error) {
+      console.warn(`Image edit provider ${keyLabel} threw`, error);
+    } finally {
+      clearTimeout(timeout);
     }
-
-    const data = (await response.json()) as { data?: Array<{ b64_json?: string }> };
-    const base64 = data.data?.[0]?.b64_json;
-    if (!base64) return null;
-
-    return {
-      imageUrl: `data:image/png;base64,${base64}`,
-      imageBytes: Uint8Array.from(Buffer.from(base64, "base64")),
-      mimeType: "image/png",
-      model: `${model} edit-outpaint`,
-      prompt,
-    };
-  } catch (error) {
-    console.warn(error);
-    return null;
-  } finally {
-    clearTimeout(timeout);
   }
+  return null;
 }
 
 function fallbackImage(prompt: string, model: string): GeneratedImage {
@@ -218,4 +224,19 @@ function fallbackImage(prompt: string, model: string): GeneratedImage {
     model,
     prompt,
   };
+}
+
+export function getOpenAIKeyPool() {
+  const keys = [
+    ...(process.env.OPENAI_API_KEYS ?? "").split(","),
+    process.env.OPENAI_API_KEY ?? "",
+  ]
+    .map((key) => key.trim())
+    .filter(Boolean);
+  return [...new Set(keys)];
+}
+
+function getOpenAIKeyLabel(apiKey: string) {
+  const index = getOpenAIKeyPool().indexOf(apiKey);
+  return `key #${index + 1}`;
 }

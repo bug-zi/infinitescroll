@@ -1,4 +1,5 @@
 import type { GenerationJob, GenerationLog, Scroll, ScrollImage, SystemStatus } from "../types";
+import { createCreativePlan } from "../lib/creativePlan";
 import { FIXED_OVERLAP_PRESET, FIXED_OVERLAP_RATIO, getStitchCrops } from "../lib/stitching";
 
 const baseImage = "/assets/scroll-segment.svg";
@@ -92,7 +93,7 @@ export const mockImages: ScrollImage[] = Array.from({ length: 12 }, (_, index) =
     index: index + 1,
     title: `第 ${index + 1} 张`,
     src: baseImage,
-    generatedAt: `2024-05-20T10:${String(10 + index * 5).padStart(2, "0")}:12+08:00`,
+    generatedAt: new Date(new Date("2024-05-20T10:10:12+08:00").getTime() + index * 5 * 60000).toISOString(),
     prompt: [
       "汴京城外的田野、村庄与远山",
       "拱桥与河面船只，市民聚集",
@@ -122,6 +123,13 @@ export const mockJobs: GenerationJob[] = [
     type: "auto_next",
     status: "queued",
     scheduledFor: mockScrolls[0].nextRunAt,
+    creativePlan: createCreativePlan({
+      theme: mockScrolls[0].originalTheme,
+      optimizedPrompt: mockScrolls[0].optimizedPrompt,
+      previousPrompt: mockImages[11].prompt,
+      targetIndex: 13,
+      hasReferenceImage: true,
+    }),
   },
   {
     id: "job-14",
@@ -130,6 +138,13 @@ export const mockJobs: GenerationJob[] = [
     type: "auto_next",
     status: "queued",
     scheduledFor: new Date(Date.now() + 492000).toISOString(),
+    creativePlan: createCreativePlan({
+      theme: mockScrolls[0].originalTheme,
+      optimizedPrompt: mockScrolls[0].optimizedPrompt,
+      previousPrompt: mockImages[11].prompt,
+      targetIndex: 14,
+      hasReferenceImage: true,
+    }),
   },
   {
     id: "job-15",
@@ -138,6 +153,13 @@ export const mockJobs: GenerationJob[] = [
     type: "auto_next",
     status: "queued",
     scheduledFor: new Date(Date.now() + 792000).toISOString(),
+    creativePlan: createCreativePlan({
+      theme: mockScrolls[0].originalTheme,
+      optimizedPrompt: mockScrolls[0].optimizedPrompt,
+      previousPrompt: mockImages[11].prompt,
+      targetIndex: 15,
+      hasReferenceImage: true,
+    }),
   },
   {
     id: "job-16",
@@ -146,6 +168,13 @@ export const mockJobs: GenerationJob[] = [
     type: "auto_next",
     status: "queued",
     scheduledFor: new Date(Date.now() + 1092000).toISOString(),
+    creativePlan: createCreativePlan({
+      theme: mockScrolls[0].originalTheme,
+      optimizedPrompt: mockScrolls[0].optimizedPrompt,
+      previousPrompt: mockImages[11].prompt,
+      targetIndex: 16,
+      hasReferenceImage: true,
+    }),
   },
   {
     id: "job-17",
@@ -154,6 +183,13 @@ export const mockJobs: GenerationJob[] = [
     type: "auto_next",
     status: "queued",
     scheduledFor: new Date(Date.now() + 1392000).toISOString(),
+    creativePlan: createCreativePlan({
+      theme: mockScrolls[0].originalTheme,
+      optimizedPrompt: mockScrolls[0].optimizedPrompt,
+      previousPrompt: mockImages[11].prompt,
+      targetIndex: 17,
+      hasReferenceImage: true,
+    }),
   },
 ];
 
@@ -186,10 +222,15 @@ export const mockLogs: GenerationLog[] = [
 
 export const mockSystemStatus: SystemStatus = {
   cronRunning: true,
+  serviceRunning: true,
+  autoGenerationEnabled: true,
   nextGlobalRunLabel: "03:12",
   generatedToday: 12,
   totalGenerated: 156,
   apiHealthPercent: 75,
   activeConcurrentJobs: 1,
   maxConcurrentJobs: 2,
+  failedJobs: 1,
+  activeScrolls: 1,
+  statusError: null,
 };

@@ -4,6 +4,7 @@ import {
   computeInitialPan,
   computePanForHeldDirection,
   computeSegmentLayout,
+  computeVisibleImageLayout,
   computeZoomAroundPoint,
 } from "./panoramaViewer";
 import type { ScrollImage } from "../types";
@@ -55,12 +56,21 @@ describe("panorama viewer math", () => {
     expect(layout.totalWidth).toBe(718);
   });
 
+  test("computes the visible crop layout so preview edges mark the true seam", () => {
+    const crop = computeVisibleImageLayout(overlappedImage("image-2"), 192);
+
+    expect(crop.width).toBe(231);
+    expect(crop.imageWidth).toBe(288);
+    expect(crop.imageOffsetLeft).toBe(58);
+    expect(crop.overlapLeft).toBe(58);
+  });
+
   test("centers the clicked segment in the viewport", () => {
     const layout = computeSegmentLayout([image("image-1", 1024), image("image-2", 896), image("image-3", 896)], 192);
 
     const pan = computeInitialPan(layout, "image-2", 800);
 
-    expect(pan).toBe(32);
+    expect(pan).toBe(-16);
   });
 
   test("held direction movement ramps with hold time and honors direction", () => {

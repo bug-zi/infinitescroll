@@ -1,4 +1,5 @@
 import type { GenerationJob, GenerationLog, OverlapPreset, Scroll, ScrollImage } from "../types";
+import { normalizeCreativePlan } from "./creativePlan";
 import { normalizeImageRatioLabel } from "./stitching";
 
 type JsonCrop = {
@@ -76,6 +77,12 @@ export function mapJobRow(row: Record<string, any>): GenerationJob {
     type: row.type,
     status: row.status,
     scheduledFor: row.scheduled_for,
+    creativePlan: row.creative_plan
+      ? normalizeCreativePlan(row.creative_plan, {
+          targetIndex: Number(row.target_index ?? 1),
+          hasReferenceImage: Number(row.target_index ?? 1) > 1,
+        })
+      : undefined,
     errorMessage: row.error_message ?? undefined,
   };
 }

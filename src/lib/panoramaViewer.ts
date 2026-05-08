@@ -19,24 +19,47 @@ export type PanoramaLayout = {
   height: number;
 };
 
+export type VisibleImageLayout = {
+  width: number;
+  height: number;
+  imageWidth: number;
+  imageOffsetLeft: number;
+  overlapLeft: number;
+};
+
 export function clampScale(scale: number) {
   return Math.max(MIN_PANORAMA_SCALE, Math.min(MAX_PANORAMA_SCALE, scale));
+}
+
+function scaleByHeight(value: number, sourceHeight: number, targetHeight: number) {
+  return Math.round((value / sourceHeight) * targetHeight);
+}
+
+export function computeVisibleImageLayout(image: ScrollImage, targetHeight: number): VisibleImageLayout {
+  const imageWidth = scaleByHeight(image.dimensions.width, image.dimensions.height, targetHeight);
+  const visibleWidth = scaleByHeight(image.visibleCrop.width, image.dimensions.height, targetHeight);
+
+  return {
+    width: visibleWidth > 0 ? visibleWidth : imageWidth,
+    height: targetHeight,
+    imageWidth,
+    imageOffsetLeft: scaleByHeight(image.visibleCrop.x, image.dimensions.height, targetHeight),
+    overlapLeft: scaleByHeight(image.overlapCrop.width, image.dimensions.height, targetHeight),
+  };
 }
 
 export function computeSegmentLayout(images: ScrollImage[], targetHeight: number): PanoramaLayout {
   let left = 0;
   const segments = images.map((image) => {
-    const imageWidth = Math.round((image.dimensions.width / image.dimensions.height) * targetHeight);
-    const overlapLeft = Math.round((image.overlapCrop.width / image.dimensions.height) * targetHeight);
-    const visibleWidth = Math.round((image.visibleCrop.width / image.dimensions.height) * targetHeight);
+    const crop = computeVisibleImageLayout(image, targetHeight);
     const segment = {
       id: image.id,
       left,
-      width: visibleWidth > 0 ? visibleWidth : imageWidth,
-      height: targetHeight,
-      overlapLeft,
-      imageWidth,
-      imageOffsetLeft: Math.round((image.visibleCrop.x / image.dimensions.height) * targetHeight),
+      width: crop.width,
+      height: crop.height,
+      overlapLeft: crop.overlapLeft,
+      imageWidth: crop.imageWidth,
+      imageOffsetLeft: crop.imageOffsetLeft,
     };
     left += segment.width;
     return segment;
@@ -53,7 +76,7 @@ export function computeInitialPan(layout: PanoramaLayout, imageId: string, viewp
   const segment = layout.segments.find((item) => item.id === imageId) ?? layout.segments[0];
   if (!segment) return 0;
   const segmentCenter = segment.left + segment.width / 2;
-  return viewportWidth / 2 - segmentCenter;
+  return layout.totalWidth / 2 - segmentCenter;
 }
 
 export function computePanForHeldDirection(currentX: number, direction: "left" | "right", heldMs: number, scale: number) {

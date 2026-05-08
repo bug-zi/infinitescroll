@@ -55,10 +55,14 @@ create table if not exists generation_jobs (
   locked_at timestamptz,
   locked_by text,
   retry_count integer not null default 0,
+  creative_plan jsonb,
   error_message text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table if exists generation_jobs
+  add column if not exists creative_plan jsonb;
 
 create table if not exists generation_logs (
   id uuid primary key default gen_random_uuid(),

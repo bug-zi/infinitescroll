@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import sharp from "sharp";
-import { generateImage, generateOutpaintedImage } from "./ai";
+import { generateImage, generateOutpaintedImage, getOpenAIKeyPool } from "./ai";
 
 describe("generateImage", () => {
   const originalApiKey = process.env.OPENAI_API_KEY;
+  const originalApiKeys = process.env.OPENAI_API_KEYS;
 
   afterEach(() => {
     process.env.OPENAI_API_KEY = originalApiKey;
+    process.env.OPENAI_API_KEYS = originalApiKeys;
     vi.restoreAllMocks();
   });
 
@@ -32,13 +34,46 @@ describe("generateImage", () => {
       detail: "high",
     });
   });
+
+  it("rotates to the next key when the first image generation key fails", async () => {
+    process.env.OPENAI_API_KEY = "";
+    process.env.OPENAI_API_KEYS = "first-key,second-key";
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("bad gateway", { status: 502 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            output: [{ type: "image_generation_call", result: Buffer.from("png").toString("base64") }],
+          }),
+          { status: 200 },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await generateImage("continue the scroll");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect((fetchMock.mock.calls[0][1] as RequestInit).headers).toMatchObject({ Authorization: "Bearer first-key" });
+    expect((fetchMock.mock.calls[1][1] as RequestInit).headers).toMatchObject({ Authorization: "Bearer second-key" });
+    expect(result.imageBytes).toBeDefined();
+    expect(result.model).toContain("key #2");
+  });
+
+  it("deduplicates the key pool", () => {
+    process.env.OPENAI_API_KEY = "primary";
+    process.env.OPENAI_API_KEYS = "primary,backup";
+    expect(getOpenAIKeyPool()).toEqual(["primary", "backup"]);
+  });
 });
 
 describe("generateOutpaintedImage", () => {
   const originalApiKey = process.env.OPENAI_API_KEY;
+  const originalApiKeys = process.env.OPENAI_API_KEYS;
 
   afterEach(() => {
     process.env.OPENAI_API_KEY = originalApiKey;
+    process.env.OPENAI_API_KEYS = originalApiKeys;
     vi.restoreAllMocks();
   });
 
@@ -117,6 +152,7 @@ describe("generateOutpaintedImage", () => {
 
   it("does not fall back to plain image generation when outpaint editing fails", async () => {
     process.env.OPENAI_API_KEY = "test-key";
+    process.env.OPENAI_API_KEYS = "";
     const fetchMock = vi.fn(async () => new Response("edit failed", { status: 500 }));
     vi.stubGlobal("fetch", fetchMock);
 
@@ -136,5 +172,41 @@ describe("generateOutpaintedImage", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(result.imageBytes).toBeUndefined();
     expect(result.model).toContain("outpaint");
+  });
+
+  it("rotates to the next key when image edit fails", async () => {
+    process.env.OPENAI_API_KEY = "";
+    process.env.OPENAI_API_KEYS = "first-key,second-key";
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("bad gateway", { status: 502 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            data: [{ b64_json: Buffer.from("png").toString("base64") }],
+          }),
+          { status: 200 },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const previousImage = await sharp({
+      create: {
+        width: 1024,
+        height: 768,
+        channels: 3,
+        background: { r: 120, g: 120, b: 120 },
+      },
+    })
+      .png()
+      .toBuffer();
+
+    const result = await generateOutpaintedImage("continue strictly from the previous segment", previousImage, 0.25, "edge", 230, 768);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect((fetchMock.mock.calls[0][1] as RequestInit).headers).toMatchObject({ Authorization: "Bearer first-key" });
+    expect((fetchMock.mock.calls[1][1] as RequestInit).headers).toMatchObject({ Authorization: "Bearer second-key" });
+    expect(result.imageBytes).toBeDefined();
+    expect(result.model).toContain("key #2");
   });
 });

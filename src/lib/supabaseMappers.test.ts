@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mapImageRow, mapLogRow } from "./supabaseMappers";
+import { mapImageRow, mapJobRow, mapLogRow } from "./supabaseMappers";
 
 describe("mapLogRow", () => {
   it("replaces question-mark mojibake logs with readable fallback text", () => {
@@ -39,5 +39,31 @@ describe("mapImageRow", () => {
     });
 
     expect(image.dimensions.ratioLabel).toBe("4:3");
+  });
+});
+
+describe("mapJobRow", () => {
+  it("maps persisted creative plan JSON for visible and generation use", () => {
+    const job = mapJobRow({
+      id: "job-1",
+      scroll_id: "scroll-1",
+      target_index: 13,
+      type: "auto_next",
+      status: "queued",
+      scheduled_for: "2026-05-07T12:04:04.000Z",
+      creative_plan: {
+        title: "第 13 张：桥头税关",
+        continuityAnchor: "承接上一张右侧桥头栏杆。",
+        newScene: "展开税关、货担与排队商旅。",
+        composition: "桥头在左，税关在中，街巷向右延伸。",
+        forbidden: "不得换成山水空景。",
+        promptFragment: "严格按桥头税关计划生成。",
+      },
+    });
+
+    expect(job.creativePlan).toMatchObject({
+      title: "第 13 张：桥头税关",
+      promptFragment: "严格按桥头税关计划生成。",
+    });
   });
 });

@@ -1,10 +1,12 @@
 import { createServer } from "node:http";
 import { Buffer } from "node:buffer";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
 import sharp from "sharp";
 import { persistGeneratedImageToSupabase } from "./dev-storage.mjs";
+import { createTimeoutFetch } from "./supabase-fetch.mjs";
 
 loadEnv(".env.local");
 
@@ -13,14 +15,13 @@ const FIXED_OVERLAP_PRESET = "maximum";
 const FIXED_OVERLAP_RATIO = 0.25;
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
-});
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-  baseURL: normalizeOpenAIBaseUrl(process.env.OPENAI_BASE_URL),
+  global: { fetch: createTimeoutFetch() },
 });
 const schedulerState = {
   enabled: process.env.DISABLE_LOCAL_AUTO_GENERATION !== "true",
   intervalMs: Number(process.env.LOCAL_AUTO_GENERATION_POLL_MS ?? 30000),
+  started: false,
+  intervalActive: false,
   running: false,
   lastTickAt: null,
   lastResult: null,
@@ -30,11 +31,16 @@ const generationTimeoutMs = Number(process.env.GENERATION_TIMEOUT_MS ?? 12 * 60 
 const SCROLL_IMAGE_HEIGHT = 1152;
 const SCROLL_VISIBLE_WIDTH = 1536;
 
-const server = createServer(async (req, res) => {
+export async function handleDevApiRequest(req, res) {
   try {
     const url = new URL(req.url ?? "/", `http://127.0.0.1:${port}`);
 
     if (req.method === "POST" && url.pathname === "/api/cron/generate") {
+      if (!isCronRequestAuthorized(req.headers.authorization)) {
+        json(res, 401, { error: "Unauthorized" });
+        return;
+      }
+
       const scrollId = url.searchParams.get("scrollId");
       const manual = url.searchParams.get("manual") === "1" || url.searchParams.get("background") === "1";
       if (scrollId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(scrollId)) {
@@ -52,7 +58,7 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/api/bootstrap/data") {
-      const data = await loadAppData();
+      const data = await loadBootstrapData();
       json(res, 200, data);
       return;
     }
@@ -107,9 +113,7 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/api/system/status") {
-      await releaseStaleRunningJobsForStatus();
-      const data = await loadAppData();
-      json(res, 200, buildSystemStatus(data));
+      json(res, 200, buildSystemStatus({ scrolls: [], images: [], jobs: [], logs: [] }));
       return;
     }
 
@@ -121,23 +125,37 @@ const server = createServer(async (req, res) => {
 
     json(res, 404, { error: "Not found" });
   } catch (error) {
-    log(error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? ""}` : safeStringify(error));
-    json(res, 500, { error: error instanceof Error ? error.message : "API error" });
+    log(error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? ""}` : formatUnknownError(error));
+    json(res, 500, { error: formatUnknownError(error) });
   }
-});
+}
 
-server.listen(port, "127.0.0.1", () => {
-  console.log(`Local API server listening on http://127.0.0.1:${port}`);
-  if (schedulerState.enabled) {
-    console.log(`Local auto-generation scheduler enabled. Polling every ${Math.round(schedulerState.intervalMs / 1000)}s.`);
-    setInterval(() => {
-      runSchedulerTick("interval").catch((error) => {
-        schedulerState.lastError = error instanceof Error ? error.message : String(error);
-        log(`scheduler tick failed: ${schedulerState.lastError}`);
-      });
-    }, schedulerState.intervalMs);
-  }
-});
+export function startDevApiServer({ host = "127.0.0.1", listenPort = port } = {}) {
+  const server = createServer(handleDevApiRequest);
+  server.listen(listenPort, host, () => {
+    console.log(`Local API server listening on http://${host}:${listenPort}`);
+    startLocalScheduler();
+  });
+  return server;
+}
+
+export function startLocalScheduler() {
+  if (!schedulerState.enabled || schedulerState.started) return;
+  schedulerState.started = true;
+  schedulerState.intervalActive = true;
+  console.log(`Local auto-generation scheduler enabled. Polling every ${Math.round(schedulerState.intervalMs / 1000)}s.`);
+  const interval = setInterval(() => {
+    runSchedulerTick("interval").catch((error) => {
+      schedulerState.lastError = formatUnknownError(error);
+      log(`scheduler tick failed: ${schedulerState.lastError}`);
+    });
+  }, schedulerState.intervalMs);
+  interval.unref?.();
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  startDevApiServer();
+}
 
 async function runSchedulerTick(source) {
   if (!schedulerState.enabled) return { skipped: "scheduler_disabled" };
@@ -151,7 +169,7 @@ async function runSchedulerTick(source) {
     if (result.length) log(`scheduler ${source} generated ${result.length} result(s)`);
     return schedulerState.lastResult;
   } catch (error) {
-    schedulerState.lastError = error instanceof Error ? error.message : String(error);
+    schedulerState.lastError = formatUnknownError(error);
     throw error;
   } finally {
     schedulerState.running = false;
@@ -196,12 +214,15 @@ async function createScroll(theme) {
 
   if (error) throw error;
 
-  await supabase.from("generation_jobs").insert({
-    scroll_id: data.id,
-    target_index: 1,
-    type: "auto_next",
-    status: "queued",
-    scheduled_for: nextRunAt,
+  await insertInitialJob({
+    scrollId: data.id,
+    scheduledFor: nextRunAt,
+    creativePlan: createCreativePlan({
+      theme: cleanTheme,
+      optimizedPrompt,
+      targetIndex: 1,
+      hasReferenceImage: false,
+    }),
   });
   await supabase.from("generation_logs").insert({
     scroll_id: data.id,
@@ -332,21 +353,57 @@ async function loadAppData() {
   };
 }
 
+async function loadSystemStatusData() {
+  try {
+    await releaseStaleRunningJobsForStatus();
+    const [scrolls, images, jobs] = await Promise.all([
+      supabase.from("scrolls").select("id,auto_generation_enabled,next_run_at"),
+      supabase.from("scroll_images").select("id,generated_at"),
+      supabase.from("generation_jobs").select("id,status"),
+    ]);
+    const error = scrolls.error ?? images.error ?? jobs.error;
+    if (error) throw error;
+    return {
+      scrolls: scrolls.data ?? [],
+      images: images.data ?? [],
+      jobs: jobs.data ?? [],
+      logs: [],
+    };
+  } catch (error) {
+    schedulerState.lastError = formatUnknownError(error);
+    log(`system status degraded: ${schedulerState.lastError}`);
+    return { scrolls: [], images: [], jobs: [], logs: [], statusError: schedulerState.lastError };
+  }
+}
+
+async function loadBootstrapData() {
+  try {
+    return await loadAppData();
+  } catch (error) {
+    schedulerState.lastError = formatUnknownError(error);
+    log(`bootstrap data degraded: ${schedulerState.lastError}`);
+    return { scrolls: [], images: [], jobs: [], logs: [], statusError: schedulerState.lastError };
+  }
+}
+
 function buildSystemStatus(data) {
   const now = Date.now();
-  const today = new Date().toISOString().slice(0, 10);
+  const today = getStatusDateKey(new Date());
   const activeScrolls = data.scrolls.filter((scroll) => scroll.auto_generation_enabled);
   const nextScroll = activeScrolls
     .slice()
     .sort((a, b) => new Date(a.next_run_at).getTime() - new Date(b.next_run_at).getTime())[0];
   const runningJobs = data.jobs.filter((job) => job.status === "running");
   const failedJobs = data.jobs.filter((job) => job.status === "failed");
-  const generatedToday = data.images.filter((image) => String(image.generated_at ?? "").startsWith(today)).length;
+  const generatedToday = data.images.filter((image) => getStatusDateKey(image.generated_at) === today).length;
+  const serviceRunning = schedulerState.started && schedulerState.enabled;
   return {
     scheduler: schedulerState,
-    cronRunning: schedulerState.enabled,
+    cronRunning: serviceRunning,
+    serviceRunning,
+    autoGenerationEnabled: activeScrolls.length > 0,
     nextGlobalRunAt: nextScroll?.next_run_at ?? null,
-    nextGlobalRunLabel: nextScroll ? `${Math.max(0, Math.ceil((new Date(nextScroll.next_run_at).getTime() - now) / 1000))} 秒后` : "无",
+    nextGlobalRunLabel: nextScroll ? getNextRunLabel(nextScroll.next_run_at, now) : "无开启画卷",
     generatedToday,
     totalGenerated: data.images.length,
     apiHealthPercent: failedJobs.length ? Math.max(20, 100 - failedJobs.length * 15) : 100,
@@ -354,7 +411,38 @@ function buildSystemStatus(data) {
     maxConcurrentJobs: Number(process.env.MAX_CONCURRENT_JOBS ?? 2),
     failedJobs: failedJobs.length,
     activeScrolls: activeScrolls.length,
+    statusError: data.statusError ?? null,
   };
+}
+
+function getStatusDateKey(value) {
+  const date = value instanceof Date ? value : new Date(String(value ?? ""));
+  if (Number.isNaN(date.getTime())) return "";
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
+function getNextRunLabel(nextRunAt, nowMs = Date.now()) {
+  const targetMs = new Date(nextRunAt).getTime();
+  if (!Number.isFinite(targetMs)) return "时间异常";
+  const seconds = Math.ceil((targetMs - nowMs) / 1000);
+  if (seconds <= 0) return "待触发";
+  if (seconds < 60) return `${seconds} 秒后`;
+  const minutes = Math.floor(seconds / 60);
+  const restSeconds = seconds % 60;
+  if (minutes < 60) return restSeconds ? `${minutes} 分 ${restSeconds} 秒后` : `${minutes} 分后`;
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(new Date(targetMs));
 }
 
 async function generateDueImages(scrollId, options = {}) {
@@ -370,7 +458,7 @@ async function generateDueImages(scrollId, options = {}) {
   const settled = await Promise.allSettled((scrolls ?? []).map((scroll) => generateOneScrollImage(scroll)));
   return settled.map((result, index) => {
     if (result.status === "fulfilled") return result.value;
-    return { scrollId: scrolls?.[index]?.id, failed: true, error: result.reason instanceof Error ? result.reason.message : String(result.reason) };
+    return { scrollId: scrolls?.[index]?.id, failed: true, error: formatUnknownError(result.reason) };
   });
 }
 
@@ -384,7 +472,7 @@ async function generateOneScrollImage(scroll) {
       return { scrollId: scroll.id, targetIndex, skipped: "running_job_exists" };
     }
   }
-  const job = await createRunningJob(scroll.id, targetIndex, "auto_next");
+  const job = await createRunningJob(scroll, targetIndex, "auto_next");
   try {
     const isFirst = targetIndex === 1;
     const overlapRatio = FIXED_OVERLAP_RATIO;
@@ -394,7 +482,17 @@ async function generateOneScrollImage(scroll) {
     const previousVisibleBuffer = previousImage ? await readLocalPublicImage(previousImage.full_image_url) : null;
     const referenceImageBase64 =
       previousVisibleBuffer && overlapWidth > 0 ? (await extractRightOverlapByWidth(previousVisibleBuffer, overlapWidth, height)).toString("base64") : undefined;
-    const prompt = buildImagePrompt(scroll, targetIndex, Boolean(referenceImageBase64));
+    const creativePlan = normalizeCreativePlan(job.hasPersistedCreativePlan ? job.creative_plan : undefined, {
+      theme: scroll.original_theme,
+      optimizedPrompt: scroll.optimized_prompt,
+      previousPrompt: previousImage?.prompt,
+      targetIndex,
+      hasReferenceImage: Boolean(previousVisibleBuffer),
+    });
+    if (JSON.stringify(creativePlan) !== JSON.stringify(job.creative_plan)) {
+      await updateJobCreativePlan(job.id, creativePlan, now);
+    }
+    const prompt = buildImagePrompt(scroll, targetIndex, Boolean(referenceImageBase64), creativePlan);
     const generated = await withGenerationTimeout(
       previousVisibleBuffer
         ? generateOutpaintedImage(prompt, previousVisibleBuffer, overlapRatio, overlapWidth, height, width, referenceImageBase64)
@@ -408,8 +506,8 @@ async function generateOneScrollImage(scroll) {
 
     let stitchQualityScore;
     if (previousVisibleBuffer && overlapWidth > 0) {
-      generated.bytes = await copyPreviousOverlapIntoNewImage(generated.bytes, previousVisibleBuffer, overlapWidth, height, overlapRatio, width);
-      stitchQualityScore = await calculateStitchQualityScore(generated.bytes, previousVisibleBuffer, overlapWidth, height);
+      generated.bytes = await copyPreviousOverlapIntoNewImage(generated.bytes, previousVisibleBuffer, overlapWidth, height, overlapRatio, width, Math.round(overlapWidth * 0.25));
+      stitchQualityScore = await calculateVisibleSeamQualityScore(generated.bytes, overlapWidth, height, Math.round(overlapWidth * 0.125));
     } else {
       generated.bytes = await normalizeImageBuffer(generated.bytes, width, height);
     }
@@ -452,6 +550,19 @@ async function generateOneScrollImage(scroll) {
       })
       .eq("id", scroll.id);
 
+    await insertQueuedJob({
+      scrollId: scroll.id,
+      targetIndex: targetIndex + 1,
+      scheduledFor: nextRunAt,
+      creativePlan: createCreativePlan({
+        theme: scroll.original_theme,
+        optimizedPrompt: scroll.optimized_prompt,
+        previousPrompt: generated.prompt,
+        targetIndex: targetIndex + 1,
+        hasReferenceImage: true,
+      }),
+    });
+
     await supabase.from("generation_logs").insert({
       scroll_id: scroll.id,
       level: hasStitchWarning ? "warning" : "success",
@@ -462,7 +573,7 @@ async function generateOneScrollImage(scroll) {
 
     return { scrollId: scroll.id, targetIndex, imageUrl, imageId: image.id, fallback: false };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = formatUnknownError(error);
     await finishGenerationFailure(job.id, scroll.id, targetIndex, message);
     return { scrollId: scroll.id, targetIndex, failed: true, error: message };
   }
@@ -564,7 +675,21 @@ function getCandidateScrollFilters({ scrollId, manual = false, nowIso = new Date
   };
 }
 
-function isStaleRunningJob({ lockedAt, nowIso = new Date().toISOString(), staleAfterMinutes = Number(process.env.STALE_RUNNING_JOB_MINUTES ?? 15) }) {
+function getImageRequestTimeoutMs() {
+  const defaultGenerationTimeoutMs = 12 * 60 * 1000;
+  const configuredGenerationTimeoutMs = parsePositiveInteger(process.env.GENERATION_TIMEOUT_MS) ?? defaultGenerationTimeoutMs;
+  const configuredImageTimeoutMs = parsePositiveInteger(process.env.OPENAI_IMAGE_TIMEOUT_MS);
+  return Math.max(configuredGenerationTimeoutMs, configuredImageTimeoutMs ?? configuredGenerationTimeoutMs);
+}
+
+function parsePositiveInteger(value) {
+  if (!value) return undefined;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+  return Math.floor(parsed);
+}
+
+function isStaleRunningJob({ lockedAt, nowIso = new Date().toISOString(), staleAfterMinutes = Number(process.env.STALE_RUNNING_JOB_MINUTES ?? 6) }) {
   if (!lockedAt) return false;
   const lockedTime = Date.parse(lockedAt);
   const nowTime = Date.parse(nowIso);
@@ -572,22 +697,97 @@ function isStaleRunningJob({ lockedAt, nowIso = new Date().toISOString(), staleA
   return nowTime - lockedTime > staleAfterMinutes * 60000;
 }
 
-async function createRunningJob(scrollId, targetIndex, type) {
+async function createRunningJob(scroll, targetIndex, type) {
   const now = new Date().toISOString();
-  const { data, error } = await supabase
+  let queuedJobResult = await supabase
     .from("generation_jobs")
-    .insert({
-      scroll_id: scrollId,
-      target_index: targetIndex,
-      type,
-      status: "running",
-      scheduled_for: now,
-      locked_at: now,
-      locked_by: "local-dev-api",
-    })
-    .select()
-    .single();
+    .select("id,creative_plan")
+    .eq("scroll_id", scroll.id)
+    .eq("target_index", targetIndex)
+    .eq("status", "queued")
+    .order("scheduled_for", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (queuedJobResult.error && isMissingCreativePlanColumn(queuedJobResult.error)) {
+    queuedJobResult = await supabase
+      .from("generation_jobs")
+      .select("id")
+      .eq("scroll_id", scroll.id)
+      .eq("target_index", targetIndex)
+      .eq("status", "queued")
+      .order("scheduled_for", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+  }
+  if (queuedJobResult.error) throw queuedJobResult.error;
+  const queuedJob = queuedJobResult.data;
+  const hasPersistedCreativePlan = Boolean(queuedJob?.creative_plan);
+
+  const initialPlan = normalizeCreativePlan(queuedJob?.creative_plan, {
+    theme: scroll.original_theme,
+    optimizedPrompt: scroll.optimized_prompt,
+    targetIndex,
+    hasReferenceImage: targetIndex > 1,
+  });
+  let jobResult = queuedJob
+    ? await supabase
+        .from("generation_jobs")
+        .update({
+          status: "running",
+          scheduled_for: now,
+          locked_at: now,
+          locked_by: "local-dev-api",
+          creative_plan: initialPlan,
+          updated_at: now,
+        })
+        .eq("id", queuedJob.id)
+        .select()
+        .single()
+    : await supabase
+        .from("generation_jobs")
+        .insert({
+          scroll_id: scroll.id,
+          target_index: targetIndex,
+          type,
+          status: "running",
+          scheduled_for: now,
+          locked_at: now,
+          locked_by: "local-dev-api",
+          creative_plan: initialPlan,
+        })
+        .select()
+        .single();
+  if (jobResult.error && isMissingCreativePlanColumn(jobResult.error)) {
+    jobResult = queuedJob
+      ? await supabase
+          .from("generation_jobs")
+          .update({
+            status: "running",
+            scheduled_for: now,
+            locked_at: now,
+            locked_by: "local-dev-api",
+            updated_at: now,
+          })
+          .eq("id", queuedJob.id)
+          .select()
+          .single()
+      : await supabase
+          .from("generation_jobs")
+          .insert({
+            scroll_id: scroll.id,
+            target_index: targetIndex,
+            type,
+            status: "running",
+            scheduled_for: now,
+            locked_at: now,
+            locked_by: "local-dev-api",
+          })
+          .select()
+          .single();
+  }
+  const { data, error } = jobResult;
   if (error) throw error;
+  if (data) data.hasPersistedCreativePlan = hasPersistedCreativePlan;
   return data;
 }
 
@@ -601,6 +801,59 @@ async function finishJob(jobId, status, errorMessage) {
     })
     .eq("id", jobId);
   if (error) throw error;
+}
+
+function isMissingCreativePlanColumn(error) {
+  const message = String(error?.message ?? "").toLowerCase();
+  const code = String(error?.code ?? "");
+  return code === "PGRST204" || code === "42703" || (message.includes("creative_plan") && (message.includes("column") || message.includes("does not exist")));
+}
+
+async function insertInitialJob(input) {
+  const { error } = await supabase.from("generation_jobs").insert({
+    scroll_id: input.scrollId,
+    target_index: 1,
+    type: "auto_next",
+    status: "queued",
+    scheduled_for: input.scheduledFor,
+    creative_plan: input.creativePlan,
+  });
+  if (!error) return;
+  if (!isMissingCreativePlanColumn(error)) throw error;
+  const { error: fallbackError } = await supabase.from("generation_jobs").insert({
+    scroll_id: input.scrollId,
+    target_index: 1,
+    type: "auto_next",
+    status: "queued",
+    scheduled_for: input.scheduledFor,
+  });
+  if (fallbackError) throw fallbackError;
+}
+
+async function updateJobCreativePlan(jobId, creativePlan, now) {
+  const { error } = await supabase.from("generation_jobs").update({ creative_plan: creativePlan, updated_at: now }).eq("id", jobId);
+  if (error && !isMissingCreativePlanColumn(error)) throw error;
+}
+
+async function insertQueuedJob(input) {
+  const { error } = await supabase.from("generation_jobs").insert({
+    scroll_id: input.scrollId,
+    target_index: input.targetIndex,
+    type: "auto_next",
+    status: "queued",
+    scheduled_for: input.scheduledFor,
+    creative_plan: input.creativePlan,
+  });
+  if (!error) return;
+  if (!isMissingCreativePlanColumn(error)) throw error;
+  const { error: fallbackError } = await supabase.from("generation_jobs").insert({
+    scroll_id: input.scrollId,
+    target_index: input.targetIndex,
+    type: "auto_next",
+    status: "queued",
+    scheduled_for: input.scheduledFor,
+  });
+  if (fallbackError) throw fallbackError;
 }
 
 async function deleteImage(imageId) {
@@ -789,11 +1042,10 @@ async function tryImageEditOutpaint(prompt, previousImageBuffer, overlapRatio, s
   const overlapWidth = sourceOverlapWidth ?? Math.max(1, Math.round((editWidth / (1 + overlapRatio)) * overlapRatio));
   const canvas = await createOutpaintCanvas(previousImageBuffer, editWidth, editHeight, overlapWidth, sourceOverlapWidth ?? overlapWidth, sourceHeight);
   const mask = await createOutpaintMask(editWidth, editHeight, overlapWidth);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 300000);
-
-  try {
-    log(`trying Image Edit outpaint model ${model}`);
+  for (const apiKey of getOpenAIKeyPool()) {
+    const keyLabel = getOpenAIKeyLabel(apiKey);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), getImageRequestTimeoutMs());
     const form = new FormData();
     form.append("model", model);
     form.append("prompt", prompt);
@@ -805,34 +1057,38 @@ async function tryImageEditOutpaint(prompt, previousImageBuffer, overlapRatio, s
     form.append("image[]", new Blob([new Uint8Array(previousImageBuffer)], { type: "image/png" }), "previous.png");
     form.append("mask", new Blob([mask], { type: "image/png" }), "mask.png");
 
-    const response = await fetch(endpoint, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      },
-      body: form,
-    });
-    const text = await response.text();
-    log(`Image Edit response ${response.status}, length ${text.length}`);
-    if (!response.ok) return null;
-    const data = JSON.parse(text);
-    const base64 = data.data?.[0]?.b64_json;
-    if (!base64) return null;
-    return { prompt, model: `${model} edit-outpaint`, bytes: Buffer.from(base64, "base64"), mimeType: "image/png", fallback: false };
-  } catch (error) {
-    log(`Image Edit threw ${error instanceof Error ? error.message : String(error)}`);
-    return null;
-  } finally {
-    clearTimeout(timeout);
+    try {
+      log(`trying Image Edit outpaint model ${model} using ${keyLabel}`);
+      const response = await fetch(endpoint, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: form,
+      });
+      const text = await response.text();
+      log(`Image Edit ${keyLabel} response ${response.status}, length ${text.length}`);
+      if (!response.ok) continue;
+      const data = JSON.parse(text);
+      const base64 = data.data?.[0]?.b64_json;
+      if (!base64) {
+        log(`Image Edit ${keyLabel} returned no image bytes`);
+        continue;
+      }
+      return { prompt, model: `${model} edit-outpaint (${keyLabel})`, bytes: Buffer.from(base64, "base64"), mimeType: "image/png", fallback: false };
+    } catch (error) {
+      log(`Image Edit ${keyLabel} threw ${formatUnknownError(error)}`);
+    } finally {
+      clearTimeout(timeout);
+    }
   }
+  return null;
 }
 
 async function tryResponsesImageTool(prompt, referenceImageBase64) {
   const responseModel = process.env.OPENAI_RESPONSE_MODEL || process.env.OPENAI_MODEL || "gpt-5.5";
   const imageModel = process.env.OPENAI_IMAGE_MODEL || "gpt-image-1.5";
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 240000);
   const content = [{ type: "input_text", text: prompt }];
   if (referenceImageBase64) {
     content.push({
@@ -842,82 +1098,91 @@ async function tryResponsesImageTool(prompt, referenceImageBase64) {
     });
   }
 
-  try {
-    log(`trying Responses image tool responseModel=${responseModel}, imageModel=${imageModel}`);
-    const response = await openai.responses.create(
-      {
-        model: responseModel,
-        input: [
-          {
-            role: "user",
-            content,
-          },
-        ],
-        tools: [
-          {
-            type: "image_generation",
-            model: imageModel,
-            quality: "high",
-            size: "1536x1024",
-          },
-        ],
-        reasoning: { effort: "medium" },
-      },
-      { signal: controller.signal },
-    );
+  for (const apiKey of getOpenAIKeyPool()) {
+    const keyLabel = getOpenAIKeyLabel(apiKey);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), getImageRequestTimeoutMs());
+    const client = createOpenAIClient(apiKey);
+    try {
+      log(`trying Responses image tool responseModel=${responseModel}, imageModel=${imageModel} using ${keyLabel}`);
+      const response = await client.responses.create(
+        {
+          model: responseModel,
+          input: [
+            {
+              role: "user",
+              content,
+            },
+          ],
+          tools: [
+            {
+              type: "image_generation",
+              model: imageModel,
+              quality: "high",
+              size: "1536x1024",
+            },
+          ],
+          reasoning: { effort: "medium" },
+        },
+        { signal: controller.signal },
+      );
 
-    const imageCall = response.output?.find((item) => item.type === "image_generation_call");
-    const base64 = imageCall?.result;
-    log(`Responses image tool status=${imageCall?.status ?? "missing"}, base64=${typeof base64 === "string" ? base64.length : 0}`);
-    if (typeof base64 !== "string" || base64.length < 100) return null;
+      const imageCall = response.output?.find((item) => item.type === "image_generation_call");
+      const base64 = imageCall?.result;
+      log(`Responses image tool ${keyLabel} status=${imageCall?.status ?? "missing"}, base64=${typeof base64 === "string" ? base64.length : 0}`);
+      if (typeof base64 !== "string" || base64.length < 100) continue;
 
-    return { prompt, model: `${responseModel} + ${imageModel}`, bytes: Buffer.from(base64, "base64"), mimeType: "image/png", fallback: false };
-  } catch (error) {
-    log(`Responses image tool threw ${error instanceof Error ? error.message : String(error)}`);
-    return null;
-  } finally {
-    clearTimeout(timeout);
+      return { prompt, model: `${responseModel} + ${imageModel} (${keyLabel})`, bytes: Buffer.from(base64, "base64"), mimeType: "image/png", fallback: false };
+    } catch (error) {
+      log(`Responses image tool ${keyLabel} threw ${formatUnknownError(error)}`);
+    } finally {
+      clearTimeout(timeout);
+    }
   }
+  return null;
 }
 
 async function tryImageApi(v1, model, prompt) {
   const endpoint = `${v1}/images/generations`;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 180000);
 
-  try {
-    log(`trying Image API model ${model}`);
-    const response = await fetch(endpoint, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model,
-        prompt,
-        size: "1024x1024",
-        quality: "low",
-        n: 1,
-      }),
-    });
+  for (const apiKey of getOpenAIKeyPool()) {
+    const keyLabel = getOpenAIKeyLabel(apiKey);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), getImageRequestTimeoutMs());
+    try {
+      log(`trying Image API model ${model} using ${keyLabel}`);
+      const response = await fetch(endpoint, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          prompt,
+          size: "1024x1024",
+          quality: "low",
+          n: 1,
+        }),
+      });
 
-    const text = await response.text();
-    log(`Image API response ${response.status}, length ${text.length}`);
-    if (!response.ok) return null;
+      const text = await response.text();
+      log(`Image API ${keyLabel} response ${response.status}, length ${text.length}`);
+      if (!response.ok) continue;
 
-    const data = JSON.parse(text);
-    const base64 = data.data?.[0]?.b64_json;
-    if (!base64) return null;
+      const data = JSON.parse(text);
+      const base64 = data.data?.[0]?.b64_json;
+      if (!base64) continue;
 
-    return { prompt, model, bytes: Buffer.from(base64, "base64"), mimeType: "image/png", fallback: false };
-  } catch (error) {
-    log(`Image API threw ${error instanceof Error ? error.message : String(error)}`);
-    return null;
-  } finally {
-    clearTimeout(timeout);
+      return { prompt, model: `${model} (${keyLabel})`, bytes: Buffer.from(base64, "base64"), mimeType: "image/png", fallback: false };
+    } catch (error) {
+      log(`Image API ${keyLabel} threw ${formatUnknownError(error)}`);
+    } finally {
+      clearTimeout(timeout);
+    }
   }
+  return null;
 }
 
 async function persistImage(scrollId, targetIndex, generated) {
@@ -957,29 +1222,60 @@ async function extractRightOverlapByWidth(imageBuffer, overlapWidth, height = 76
     .toBuffer();
 }
 
-async function copyPreviousOverlapIntoNewImage(newImageBuffer, previousImageBuffer, overlapWidth, height, overlapRatio, width = 1152) {
+async function copyPreviousOverlapIntoNewImage(newImageBuffer, previousImageBuffer, overlapWidth, height, overlapRatio, width = 1152, featherWidth = 0) {
   const normalizedNew = await normalizeImageBuffer(newImageBuffer, width, height);
   const resizedPrevOverlap = await extractRightOverlapByWidth(previousImageBuffer, overlapWidth, height);
+  const composite = [{ input: resizedPrevOverlap, left: 0, top: 0, blend: "over" }];
+  const safeFeatherWidth = Math.max(0, Math.min(Math.floor(featherWidth), overlapWidth));
+  if (safeFeatherWidth > 0) {
+    const featherRgb = await sharp(resizedPrevOverlap)
+      .extract({ left: Math.max(0, overlapWidth - safeFeatherWidth), top: 0, width: safeFeatherWidth, height })
+      .resize(safeFeatherWidth, height, { fit: "fill" })
+      .removeAlpha()
+      .raw()
+      .toBuffer();
+    const featherRgba = Buffer.alloc(safeFeatherWidth * height * 4);
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < safeFeatherWidth; x += 1) {
+        const rgbOffset = (y * safeFeatherWidth + x) * 3;
+        const rgbaOffset = (y * safeFeatherWidth + x) * 4;
+        const alpha = Math.round(150 * (1 - x / Math.max(1, safeFeatherWidth - 1)));
+        featherRgba[rgbaOffset] = featherRgb[rgbOffset];
+        featherRgba[rgbaOffset + 1] = featherRgb[rgbOffset + 1];
+        featherRgba[rgbaOffset + 2] = featherRgb[rgbOffset + 2];
+        featherRgba[rgbaOffset + 3] = alpha;
+      }
+    }
+    const featherSource = await sharp(featherRgba, { raw: { width: safeFeatherWidth, height, channels: 4 } }).png().toBuffer();
+    composite.push({ input: featherSource, left: overlapWidth, top: 0, blend: "over" });
+  }
   return sharp(normalizedNew)
-    .composite([{ input: resizedPrevOverlap, left: 0, top: 0, blend: "over" }])
+    .composite(composite)
     .png()
     .toBuffer();
 }
 
-async function calculateStitchQualityScore(newImageBuffer, previousImageBuffer, overlapWidth, height) {
-  const newOverlap = await sharp(newImageBuffer)
-    .resize({ height, fit: "cover", position: "center" })
-    .extract({ left: 0, top: 0, width: overlapWidth, height })
+async function calculateVisibleSeamQualityScore(imageBuffer, seamX, height, bandWidth = 48) {
+  const metadata = await sharp(imageBuffer).metadata();
+  const width = metadata.width ?? seamX * 2;
+  const normalized = await normalizeImageBuffer(imageBuffer, width, height);
+  const safeSeamX = Math.max(1, Math.min(Math.round(seamX), width - 1));
+  const safeBandWidth = Math.max(1, Math.min(Math.floor(bandWidth), safeSeamX, width - safeSeamX));
+  const leftBand = await sharp(normalized)
+    .extract({ left: safeSeamX - safeBandWidth, top: 0, width: safeBandWidth, height })
     .removeAlpha()
     .raw()
     .toBuffer();
-  const prevOverlap = await extractRightOverlapByWidth(previousImageBuffer, overlapWidth, height);
-  const previousRaw = await sharp(prevOverlap).removeAlpha().raw().toBuffer();
-  const length = Math.min(newOverlap.length, previousRaw.length);
+  const rightBand = await sharp(normalized)
+    .extract({ left: safeSeamX, top: 0, width: safeBandWidth, height })
+    .removeAlpha()
+    .raw()
+    .toBuffer();
+  const length = Math.min(leftBand.length, rightBand.length);
   if (!length) return 0;
 
   let totalDifference = 0;
-  for (let index = 0; index < length; index += 1) totalDifference += Math.abs(newOverlap[index] - previousRaw[index]);
+  for (let index = 0; index < length; index += 1) totalDifference += Math.abs(leftBand[index] - rightBand[index]);
   const meanDifference = totalDifference / length;
   return Math.max(0, Math.min(100, Math.round(100 - (meanDifference / 255) * 100)));
 }
@@ -1042,7 +1338,116 @@ function fallbackPrompt(theme) {
   return `以「${theme}」为主题生成连续横向画卷，保持统一风格、空间连续和左到右叙事。`;
 }
 
-function buildImagePrompt(scroll, targetIndex, hasReferenceImage = false) {
+const PLAN_ARCS = [
+  {
+    title: "河岸街市延展",
+    newScene: "向右展开河岸茶肆、卸货小船、挑担行人、临街摊铺与停靠车马，让市井活动从上一段自然延伸。",
+  },
+  {
+    title: "桥市人潮推进",
+    newScene: "展开桥头人潮、货担队列、临水店铺、船工与看客，使道路和河道同时向右推进。",
+  },
+  {
+    title: "城门道路承接",
+    newScene: "展开通向城门的道路、驴车、行商、守门兵士与墙根摊贩，让空间从郊野进入城郭。",
+  },
+  {
+    title: "坊巷商铺展开",
+    newScene: "展开茶楼酒肆、幌子招牌、门前顾客、穿街儿童和运货车马，让街市密度逐步升高。",
+  },
+  {
+    title: "水巷宅院过渡",
+    newScene: "展开水边宅院、柳树、石阶、停泊小舟与搬运行人，让繁华街市暂时转入生活场景。",
+  },
+  {
+    title: "远郊田畴续写",
+    newScene: "展开田畴、村舍、驿路、农人和远山薄雾，让画卷节奏从密集市井舒缓过渡。",
+  },
+];
+
+function cleanPlanText(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function pickPlanArc(targetIndex) {
+  return PLAN_ARCS[Math.abs(targetIndex - 1) % PLAN_ARCS.length];
+}
+
+function createCreativePlan(input) {
+  const targetIndex = Math.max(1, Math.floor(Number(input.targetIndex ?? 1)));
+  const isFirst = targetIndex === 1;
+  const arc = pickPlanArc(targetIndex);
+  const theme = cleanPlanText(input.theme) || "连续横向中国手卷";
+  const optimizedPrompt = cleanPlanText(input.optimizedPrompt);
+  const previousPrompt = cleanPlanText(input.previousPrompt);
+  const continuityAnchor = isFirst
+    ? "建立可持续延展的河道、道路、屋檐高度、远山层次和人群动线，为后续画面留下清晰右缘。"
+    : "锁定上一张右缘的河道水线、桥梁弧线、岸边道路、屋檐高度和人群行进方向。";
+  const composition = isFirst
+    ? "主体从中景展开，右缘保留可继续延伸的道路、水系、建筑轮廓和人物方向。"
+    : "左侧重叠区只负责承接，主体事件放在中右部；河道、道路和屋檐线保持同一消失方向。";
+  const forbidden = isFirst
+    ? "不得出现现代物品、文字、水印、边框或孤立大特写；不得把第一张画成封面海报。"
+    : "不得改动左侧重叠区；不得突然换时代、季节、视角或光照；不得用大面积空景打断画卷节奏。";
+
+  return {
+    title: `第 ${targetIndex} 张：${arc.title}`,
+    continuityAnchor,
+    newScene: arc.newScene,
+    composition,
+    forbidden,
+    promptFragment: [
+      `画卷主题：${theme}`,
+      optimizedPrompt ? `长期风格方向：${optimizedPrompt}` : "",
+      previousPrompt ? `上一张内容线索：${previousPrompt}` : "",
+      input.hasReferenceImage ? "已提供上一张右缘参考图，必须把它作为硬衔接锚点。" : "未提供上一张右缘参考图时，仍要保持横向长卷叙事连续。",
+      `本张计划：${arc.newScene}`,
+      `衔接要求：${continuityAnchor}`,
+      `构图要求：${composition}`,
+      `禁止偏移：${forbidden}`,
+    ]
+      .filter(Boolean)
+      .join("\n"),
+  };
+}
+
+function planField(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeCreativePlan(value, fallbackInput) {
+  const fallback = createCreativePlan(fallbackInput);
+  if (!value || typeof value !== "object") return fallback;
+  const plan = {
+    title: planField(value.title) || fallback.title,
+    continuityAnchor: planField(value.continuityAnchor) || fallback.continuityAnchor,
+    newScene: planField(value.newScene) || fallback.newScene,
+    composition: planField(value.composition) || fallback.composition,
+    forbidden: planField(value.forbidden) || fallback.forbidden,
+    promptFragment: planField(value.promptFragment),
+  };
+  return {
+    ...plan,
+    promptFragment:
+      plan.promptFragment ||
+      [`本张计划：${plan.newScene}`, `衔接要求：${plan.continuityAnchor}`, `构图要求：${plan.composition}`, `禁止偏移：${plan.forbidden}`].join("\n"),
+  };
+}
+
+function buildCreativePlanPromptSection(plan) {
+  return [
+    "Creative plan for this exact segment:",
+    `Title: ${plan.title}`,
+    `Continuity anchor: ${plan.continuityAnchor}`,
+    `New scene: ${plan.newScene}`,
+    `Composition: ${plan.composition}`,
+    `Forbidden drift: ${plan.forbidden}`,
+    "Follow this plan exactly; the visible generation plan shown to the user is this same plan.",
+    plan.promptFragment,
+  ].join("\n");
+}
+
+function buildImagePrompt(scroll, targetIndex, hasReferenceImage = false, creativePlan = createCreativePlan({ targetIndex, hasReferenceImage })) {
   const isFirst = targetIndex === 1;
   const theme = String(scroll.original_theme ?? "清明上河图风格长卷");
   const optimizedPrompt = String(scroll.optimized_prompt ?? "");
@@ -1053,6 +1458,7 @@ function buildImagePrompt(scroll, targetIndex, hasReferenceImage = false) {
     optimizedPrompt ? `Long-term scroll direction: ${optimizedPrompt}` : "",
     `This is segment ${targetIndex}. ${isFirst ? "Start the scroll naturally with a 4:3 establishing composition." : "The left edge will be replaced with a pixel-perfect overlap from the previous image; focus on generating coherent new content to the right while matching the reference edge."}`,
     hasReferenceImage ? "A reference image is attached showing the exact previous right edge. Continue from it naturally into the new right-side scene." : "",
+    buildCreativePlanPromptSection(creativePlan),
     "No modern objects, no text labels, no UI, no frame, no watermark. Make it feel like a real antique panoramic scroll, not a generic fantasy landscape.",
   ]
     .filter(Boolean)
@@ -1081,8 +1487,36 @@ function normalizeOpenAIBaseUrl(value) {
   return trimmed.endsWith("/v1") ? trimmed : `${trimmed}/v1`;
 }
 
+function getOpenAIKeyPool() {
+  const keys = [
+    ...(process.env.OPENAI_API_KEYS ?? "").split(","),
+    process.env.OPENAI_API_KEY ?? "",
+  ]
+    .map((key) => key.trim())
+    .filter(Boolean);
+  return [...new Set(keys)];
+}
+
+function getOpenAIKeyLabel(apiKey) {
+  const index = getOpenAIKeyPool().indexOf(apiKey);
+  return `key #${index + 1}`;
+}
+
+function createOpenAIClient(apiKey) {
+  return new OpenAI({
+    apiKey,
+    baseURL: normalizeOpenAIBaseUrl(process.env.OPENAI_BASE_URL),
+  });
+}
+
 function isUuid(value) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+function isCronRequestAuthorized(authorizationHeader, cronSecret = process.env.CRON_SECRET) {
+  if (!cronSecret) return true;
+  const value = Array.isArray(authorizationHeader) ? authorizationHeader[0] : authorizationHeader;
+  return value === `Bearer ${cronSecret}`;
 }
 
 function readJson(req) {
@@ -1118,4 +1552,15 @@ function safeStringify(value) {
   } catch {
     return String(value);
   }
+}
+
+function formatUnknownError(error) {
+  if (error instanceof Error) return error.message;
+  if (!error || typeof error !== "object") return String(error);
+
+  const code = typeof error.code === "string" ? error.code : "";
+  const message = typeof error.message === "string" ? error.message : "";
+  if (code && message) return `${code}: ${message}`;
+  if (message) return message;
+  return safeStringify(error);
 }

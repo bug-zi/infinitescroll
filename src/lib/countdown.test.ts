@@ -64,14 +64,70 @@ describe("countdown helpers", () => {
   test("falls back to the scroll next run when no jobs exist", () => {
     const items = getGenerationPlanItems([], scroll(), new Date("2026-05-07T12:03:04.000Z"));
 
-    expect(items).toEqual([
-      {
-        id: "scroll-1-next-run",
-        targetIndex: 13,
-        scheduledFor: "2026-05-07T12:04:04.000Z",
-        label: { text: "01:00", tone: "counting" },
-        source: "scroll",
+    expect(items[0]).toMatchObject({
+      id: "scroll-1-next-run",
+      targetIndex: 13,
+      scheduledFor: "2026-05-07T12:04:04.000Z",
+      label: { text: "01:00", tone: "counting" },
+      source: "scroll",
+      creativePlan: {
+        title: "第 13 张：河岸街市延展",
+        continuityAnchor: "锁定上一张右缘的河道水线、桥梁弧线、岸边道路、屋檐高度和人群行进方向。",
       },
-    ]);
+    });
+  });
+
+  test("uses the persisted job creative plan instead of inventing a different visible plan", () => {
+    const items = getGenerationPlanItems(
+      [
+        {
+          ...job("queued", "2026-05-07T12:04:04.000Z"),
+          creativePlan: {
+            title: "第 13 张：桥头税关",
+            continuityAnchor: "承接上一张右侧桥头栏杆。",
+            newScene: "展开税关、货担与排队商旅。",
+            composition: "桥头在左，税关在中，街巷向右延伸。",
+            forbidden: "不得换成山水空景。",
+            promptFragment: "严格按桥头税关计划生成。",
+          },
+        },
+      ],
+      scroll(),
+      new Date("2026-05-07T12:03:04.000Z"),
+    );
+
+    expect(items[0].creativePlan.title).toBe("第 13 张：桥头税关");
+    expect(items[0].creativePlan.promptFragment).toBe("严格按桥头税关计划生成。");
+  });
+
+  test("hides failed job history from the visible generation plan", () => {
+    const items = getGenerationPlanItems(
+      [
+        { ...job("failed", "2026-05-07T12:01:00.000Z"), id: "failed-1", errorMessage: "gateway failed" },
+        { ...job("failed", "2026-05-07T12:02:00.000Z"), id: "failed-2", errorMessage: "timeout" },
+        { ...job("queued", "2026-05-07T12:04:04.000Z"), id: "queued-1" },
+      ],
+      scroll(),
+      new Date("2026-05-07T12:03:04.000Z"),
+    );
+
+    expect(items.map((item) => item.id)).toEqual(["queued-1"]);
+  });
+
+  test("still shows a creative plan for a paused scroll without queued jobs", () => {
+    const items = getGenerationPlanItems(
+      [],
+      scroll({ autoGenerationEnabled: false, status: "paused" }),
+      new Date("2026-05-07T12:03:04.000Z"),
+    );
+
+    expect(items[0]).toMatchObject({
+      id: "scroll-1-next-run",
+      targetIndex: 13,
+      label: { text: "已暂停", tone: "neutral" },
+      creativePlan: {
+        title: "第 13 张：河岸街市延展",
+      },
+    });
   });
 });

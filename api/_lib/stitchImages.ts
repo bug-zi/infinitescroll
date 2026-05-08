@@ -5,6 +5,13 @@ export type StitchOptions = {
   height: number;
   overlapRatio: number;
   width?: number;
+  featherWidth?: number;
+};
+
+export type VisibleSeamScoreOptions = {
+  seamX: number;
+  height: number;
+  bandWidth?: number;
 };
 
 export async function normalizeImageBuffer(imageBuffer: Buffer | Uint8Array, targetWidth: number, targetHeight: number) {
@@ -38,10 +45,63 @@ export async function copyPreviousOverlapIntoNewImage(
 ) {
   const normalizedNew = await normalizeImageBuffer(newImageBuffer, options.width ?? 1152, options.height);
   const resizedPrevOverlap = await extractRightOverlapByWidth(previousImageBuffer, options.overlapWidth, options.height);
+  const composite: sharp.OverlayOptions[] = [{ input: resizedPrevOverlap, left: 0, top: 0, blend: "over" }];
+  const featherWidth = Math.max(0, Math.min(Math.floor(options.featherWidth ?? 0), options.overlapWidth));
+  if (featherWidth > 0) {
+    const featherRgb = await sharp(resizedPrevOverlap)
+      .extract({ left: Math.max(0, options.overlapWidth - featherWidth), top: 0, width: featherWidth, height: options.height })
+      .resize(featherWidth, options.height, { fit: "fill" })
+      .removeAlpha()
+      .raw()
+      .toBuffer();
+    const featherRgba = Buffer.alloc(featherWidth * options.height * 4);
+    for (let y = 0; y < options.height; y += 1) {
+      for (let x = 0; x < featherWidth; x += 1) {
+        const rgbOffset = (y * featherWidth + x) * 3;
+        const rgbaOffset = (y * featherWidth + x) * 4;
+        const alpha = Math.round(150 * (1 - x / Math.max(1, featherWidth - 1)));
+        featherRgba[rgbaOffset] = featherRgb[rgbOffset];
+        featherRgba[rgbaOffset + 1] = featherRgb[rgbOffset + 1];
+        featherRgba[rgbaOffset + 2] = featherRgb[rgbOffset + 2];
+        featherRgba[rgbaOffset + 3] = alpha;
+      }
+    }
+    const featherSource = await sharp(featherRgba, { raw: { width: featherWidth, height: options.height, channels: 4 } })
+      .png()
+      .toBuffer();
+    composite.push({ input: featherSource, left: options.overlapWidth, top: 0, blend: "over" });
+  }
   return sharp(normalizedNew)
-    .composite([{ input: resizedPrevOverlap, left: 0, top: 0, blend: "over" }])
+    .composite(composite)
     .png()
     .toBuffer();
+}
+
+export async function calculateVisibleSeamQualityScore(imageBuffer: Buffer | Uint8Array, options: VisibleSeamScoreOptions) {
+  const metadata = await sharp(imageBuffer).metadata();
+  const width = metadata.width ?? options.seamX * 2;
+  const height = metadata.height ?? options.height;
+  const normalized = await normalizeImageBuffer(imageBuffer, width, options.height);
+  const seamX = Math.max(1, Math.min(Math.round(options.seamX), width - 1));
+  const bandWidth = Math.max(1, Math.min(Math.floor(options.bandWidth ?? 48), seamX, width - seamX));
+
+  const leftBand = await sharp(normalized)
+    .extract({ left: seamX - bandWidth, top: 0, width: bandWidth, height: options.height })
+    .removeAlpha()
+    .raw()
+    .toBuffer();
+  const rightBand = await sharp(normalized)
+    .extract({ left: seamX, top: 0, width: bandWidth, height: options.height })
+    .removeAlpha()
+    .raw()
+    .toBuffer();
+  const length = Math.min(leftBand.length, rightBand.length);
+  if (!length || !height) return 0;
+
+  let totalDifference = 0;
+  for (let index = 0; index < length; index += 1) totalDifference += Math.abs(leftBand[index] - rightBand[index]);
+  const meanDifference = totalDifference / length;
+  return Math.max(0, Math.min(100, Math.round(100 - (meanDifference / 255) * 100)));
 }
 
 export async function createOutpaintCanvas(

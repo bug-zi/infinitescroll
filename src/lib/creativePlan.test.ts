@@ -1,7 +1,57 @@
 import { describe, expect, it } from "vitest";
-import { buildCreativePlanPromptSection, createCreativePlan, normalizeCreativePlan } from "./creativePlan";
+import { buildCreativePlanPromptSection, createCreativePlan, JOURNEY_TO_WEST_STORYBOARD, normalizeCreativePlan } from "./creativePlan";
 
 describe("createCreativePlan", () => {
+  it("keeps the first segment anchored to the user's theme instead of a fixed river-market template", () => {
+    const plan = createCreativePlan({
+      theme: "山海经神话世界",
+      optimizedPrompt: "古籍插画风格，异兽山川从左到右连续展开。",
+      targetIndex: 1,
+      hasReferenceImage: false,
+    });
+
+    expect(plan.title).toContain("山海经神话世界");
+    expect(plan.newScene).toContain("山海经神话世界");
+    expect(plan.promptFragment).toContain("山海经神话世界");
+    expect(plan.newScene).not.toContain("河岸茶肆");
+    expect(plan.promptFragment).not.toContain("清明上河图");
+  });
+
+  it("automatically uses the Journey to the West storyboard for matching themes", () => {
+    const plan = createCreativePlan({
+      theme: "西游记连环画",
+      optimizedPrompt: "传统连环画风格，唐僧师徒取经。",
+      targetIndex: 1,
+      hasReferenceImage: false,
+    });
+
+    expect(JOURNEY_TO_WEST_STORYBOARD).toHaveLength(128);
+    expect(plan.mode).toBe("story");
+    expect(plan.storyTemplate).toBe("journey_to_west");
+    expect(plan.storyFrameIndex).toBe(1);
+    expect(plan.storyTotalFrames).toBe(128);
+    expect(plan.chapter).toBe("花果山石猴");
+    expect(plan.title).toContain("石猴出世");
+    expect(plan.characters).toContain("石猴");
+    expect(plan.location).toBe("东胜神洲傲来国花果山");
+    expect(plan.promptFragment).toContain("只画当前剧情帧");
+    expect(plan.promptFragment).toContain("不得提前画后续剧情");
+  });
+
+  it("advances through distinct Journey to the West frames by target index", () => {
+    const first = createCreativePlan({ theme: "西游记", targetIndex: 1 });
+    const second = createCreativePlan({ theme: "西游记", targetIndex: 2 });
+    const last = createCreativePlan({ theme: "西游记", targetIndex: 128 });
+    const overflow = createCreativePlan({ theme: "西游记", targetIndex: 129 });
+
+    expect(first.title).toContain("石猴出世");
+    expect(second.title).toContain("群猴拜王");
+    expect(second.title).not.toBe(first.title);
+    expect(last.title).toContain("功德圆满");
+    expect(overflow.title).toContain("功德圆满");
+    expect(overflow.forbidden).toContain("剧情模板已经到达末尾");
+  });
+
   it("builds a concrete scroll continuation plan for the next segment", () => {
     const plan = createCreativePlan({
       theme: "参照《清明上河图》的风格，绘制北宋汴京城的繁华市井与自然风光",
@@ -11,14 +61,12 @@ describe("createCreativePlan", () => {
       hasReferenceImage: true,
     });
 
-    expect(plan).toMatchObject({
-      title: "第 13 张：河岸街市延展",
-      continuityAnchor: "锁定上一张右缘的河道水线、桥梁弧线、岸边道路、屋檐高度和人群行进方向。",
-      newScene: "向右展开河岸茶肆、卸货小船、挑担行人、临街摊铺与停靠车马，让市井活动从上一段自然延伸。",
-      composition: "左侧重叠区只负责承接，主体事件放在中右部；河道、道路和屋檐线保持同一消失方向。",
-      forbidden: "不得改动左侧重叠区；不得突然换时代、季节、视角或光照；不得用大面积空景打断画卷节奏。",
-    });
-    expect(plan.promptFragment).toContain("河岸茶肆");
+    expect(plan.title).toContain("清明上河图");
+    expect(plan.continuityAnchor).toContain("上一张右缘");
+    expect(plan.newScene).toContain("清明上河图");
+    expect(plan.composition).toContain("左侧重叠区");
+    expect(plan.forbidden).toContain("不得突然换");
+    expect(plan.promptFragment).toContain("清明上河图");
     expect(plan.promptFragment).toContain("左侧重叠区");
   });
 
@@ -33,10 +81,34 @@ describe("createCreativePlan", () => {
       },
     );
 
-    expect(plan.title).toBe("第 2 张：桥市人潮推进");
+    expect(plan.title).toContain("山海经神话世界");
     expect(plan.newScene).toBe("补画桥头人群");
     expect(plan.continuityAnchor).toContain("上一张右缘");
     expect(plan.promptFragment).toContain("补画桥头人群");
+  });
+
+  it("normalizes persisted story frame metadata for UI and prompt reuse", () => {
+    const plan = normalizeCreativePlan(
+      {
+        mode: "story",
+        storyTemplate: "journey_to_west",
+        storyFrameIndex: 7,
+        storyTotalFrames: 128,
+        chapter: "求仙访道",
+        title: "第 7 / 128 帧：漂洋过海",
+        newScene: "石猴乘木筏远渡重洋。",
+        characters: ["石猴"],
+        location: "东海",
+        mood: "孤勇辽阔",
+      },
+      { theme: "西游记", targetIndex: 7 },
+    );
+
+    expect(plan.mode).toBe("story");
+    expect(plan.storyFrameIndex).toBe(7);
+    expect(plan.characters).toEqual(["石猴"]);
+    expect(plan.location).toBe("东海");
+    expect(plan.promptFragment).toContain("石猴乘木筏远渡重洋");
   });
 });
 

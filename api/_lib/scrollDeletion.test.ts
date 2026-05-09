@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getStoragePathFromPublicUrl } from "./scrollDeletion";
+import { calculatePurgeAfter, getStoragePathFromPublicUrl } from "./scrollDeletion";
 
 describe("getStoragePathFromPublicUrl", () => {
   it("extracts a Supabase public storage object path", () => {
@@ -22,5 +22,11 @@ describe("getStoragePathFromPublicUrl", () => {
         "scroll-images",
       ),
     ).toBeNull();
+  });
+});
+
+describe("calculatePurgeAfter", () => {
+  it("keeps archived scrolls for seven days", () => {
+    expect(calculatePurgeAfter("2026-05-08T12:30:00.000Z")).toBe("2026-05-15T12:30:00.000Z");
   });
 });

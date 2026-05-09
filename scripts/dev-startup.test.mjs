@@ -22,4 +22,12 @@ describe("local dev startup", () => {
     expect(devApi).toContain("const data = await loadSystemStatusData()");
     expect(devApi).toContain("json(res, 200, buildSystemStatus(data))");
   });
+
+  it("keeps local generation compatible with databases that have not added archive columns yet", () => {
+    const devApi = readFileSync("scripts/dev-api.mjs", "utf8");
+
+    expect(devApi).toContain("isMissingArchiveColumnError");
+    expect(devApi).toContain("runOptionalArchiveMaintenance");
+    expect(devApi).toContain("queryMaybeActiveRows");
+  });
 });

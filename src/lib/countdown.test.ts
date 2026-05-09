@@ -71,8 +71,8 @@ describe("countdown helpers", () => {
       label: { text: "01:00", tone: "counting" },
       source: "scroll",
       creativePlan: {
-        title: "第 13 张：河岸街市延展",
-        continuityAnchor: "锁定上一张右缘的河道水线、桥梁弧线、岸边道路、屋檐高度和人群行进方向。",
+        title: "第 13 张：测试主题空间延展",
+        continuityAnchor: "锁定上一张右缘的道路、水线、建筑高度、地平线、光照方向和人群行进方向。",
       },
     });
   });
@@ -126,7 +126,7 @@ describe("countdown helpers", () => {
       targetIndex: 13,
       label: { text: "已暂停", tone: "neutral" },
       creativePlan: {
-        title: "第 13 张：河岸街市延展",
+        title: "第 13 张：测试主题空间延展",
       },
     });
   });

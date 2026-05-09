@@ -1,4 +1,4 @@
-export function createTimeoutFetch(timeoutMs = Number(process.env.SUPABASE_FETCH_TIMEOUT_MS ?? 20000)) {
+export function createTimeoutFetch(timeoutMs = Number(process.env.SUPABASE_FETCH_TIMEOUT_MS ?? 90000)) {
   return async function timeoutFetch(input, init = {}) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);

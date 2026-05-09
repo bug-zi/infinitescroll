@@ -13,6 +13,9 @@ export function summarizePrompt(prompt: string, maxLength = SUMMARY_MAX_LENGTH) 
     .map((line) => line.trim())
     .filter(Boolean);
   const preferredLine =
+    lines.find((line) => line.startsWith("当前剧情帧：")) ??
+    lines.find((line) => line.startsWith("剧情进度：")) ??
+    lines.find((line) => line.startsWith("章节：")) ??
     lines.find((line) => line.startsWith("本张计划：")) ??
     lines.find((line) => line.startsWith("New scene:")) ??
     lines.find((line) => line.startsWith("Continuity anchor:")) ??

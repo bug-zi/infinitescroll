@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
   clampScale,
+  computeImmersiveScrollHeight,
   computeInitialPan,
   computePanForHeldDirection,
   computeSegmentLayout,
@@ -100,5 +101,12 @@ describe("panorama viewer math", () => {
     expect(clampScale(0.1)).toBe(0.6);
     expect(clampScale(2)).toBe(2);
     expect(clampScale(12)).toBe(6);
+  });
+
+  test("uses most of the viewer stage for immersive scroll viewing", () => {
+    expect(computeImmersiveScrollHeight(834)).toBe(802);
+    expect(computeImmersiveScrollHeight(954)).toBe(922);
+    expect(computeImmersiveScrollHeight(360)).toBe(320);
+    expect(computeImmersiveScrollHeight(220)).toBe(204);
   });
 });

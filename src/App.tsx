@@ -1,4 +1,5 @@
-import {
+﻿import {
+  Archive,
   Bell,
   Box,
   CheckCircle2,
@@ -10,10 +11,12 @@ import {
   List,
   Loader2,
   Maximize2,
+  Minus,
   Pause,
   Play,
   Plus,
   RefreshCw,
+  Save,
   ScrollText,
   Settings,
   Trash2,
@@ -22,13 +25,17 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { confirmAction } from "./lib/confirmAction";
 import { DEFAULT_LOG_PREVIEW_LIMIT, getRecentLogs, groupLogsByScroll } from "./lib/logViews";
-import { clampScale, computeInitialPan, computePanForHeldDirection, computeSegmentLayout, computeVisibleImageLayout, computeZoomAroundPoint } from "./lib/panoramaViewer";
+import { clampScale, computeImmersiveScrollHeight, computeInitialPan, computePanForHeldDirection, computeSegmentLayout, computeVisibleImageLayout, computeZoomAroundPoint } from "./lib/panoramaViewer";
 import { summarizePrompt } from "./lib/promptDisplay";
 import { FIXED_OVERLAP_RATIO } from "./lib/stitching";
 import { formatStitchScore } from "./lib/stitchQuality";
 import { formatClock, formatDateMinute, getCountdownParts, getGenerationPlanItems } from "./lib/time";
+import { buildNotifications, defaultUserProfile, normalizeUserProfile, type NotificationItem, type UserProfile } from "./lib/userAccount";
 import { useInfiniteScrollStore } from "./lib/store";
+import { AI_SCRIPT_TEMPLATE, AI_SCRIPT_TEMPLATE_VERSION, DEFAULT_SCRIPT_FRAME_COUNT, SCRIPT_FRAME_COUNTS, type ScriptDraft, type ScriptFrame } from "./lib/scriptDraft";
 import type { GenerationJob, GenerationLog, Scroll, ScrollImage } from "./types";
+
+const USER_PROFILE_STORAGE_KEY = "infinite-scroll:user-profile:v1";
 
 const statusText: Record<Scroll["status"], string> = {
   generating: "生成中",
@@ -36,14 +43,58 @@ const statusText: Record<Scroll["status"], string> = {
   complete: "已完成",
 };
 
-type View = "workspace" | "console" | "logs" | "settings";
+type View = "workspace" | "archive" | "console" | "logs" | "settings";
 
-export function App() {
+export function App({ initialCreateScrollOpen = false }: { initialCreateScrollOpen?: boolean } = {}) {
   const store = useInfiniteScrollStore();
   const [view, setView] = useState<View>("workspace");
   const [editing, setEditing] = useState(false);
+  const [creatingScroll, setCreatingScroll] = useState(initialCreateScrollOpen);
   const [viewerInitialImageId, setViewerInitialImageId] = useState("");
+  const [toastNotification, setToastNotification] = useState<NotificationItem | null>(null);
+  const seenSuccessNotificationIds = useRef<Set<string> | null>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile>(() => {
+    if (typeof window === "undefined") return defaultUserProfile;
+    try {
+      return normalizeUserProfile(JSON.parse(window.localStorage.getItem(USER_PROFILE_STORAGE_KEY) ?? "null"));
+    } catch {
+      return defaultUserProfile;
+    }
+  });
   const countdown = store.selectedScroll ? getCountdownParts(store.selectedScroll.nextRunAt).label : "00:00";
+  const notifications = useMemo(
+    () =>
+      buildNotifications({
+        logs: store.allLogs,
+        jobs: store.allJobs,
+        selectedScroll: store.selectedScroll,
+        systemStatus: store.systemStatus,
+        preferences: userProfile.notifications,
+      }),
+    [store.allJobs, store.allLogs, store.selectedScroll, store.systemStatus, userProfile.notifications],
+  );
+
+  function saveUserProfile(nextProfile: UserProfile) {
+    const normalized = normalizeUserProfile(nextProfile);
+    setUserProfile(normalized);
+    if (typeof window !== "undefined") window.localStorage.setItem(USER_PROFILE_STORAGE_KEY, JSON.stringify(normalized));
+  }
+
+  useEffect(() => {
+    const successNotifications = notifications.filter((item) => item.level === "success");
+    if (seenSuccessNotificationIds.current === null) {
+      seenSuccessNotificationIds.current = new Set(successNotifications.map((item) => item.id));
+      return;
+    }
+
+    const newest = successNotifications.find((item) => !seenSuccessNotificationIds.current?.has(item.id));
+    for (const item of successNotifications) seenSuccessNotificationIds.current.add(item.id);
+    if (!newest || !userProfile.notifications.generationSuccess) return;
+
+    setToastNotification(newest);
+    const timer = window.setTimeout(() => setToastNotification(null), 5200);
+    return () => window.clearTimeout(timer);
+  }, [notifications, userProfile.notifications.generationSuccess]);
 
   return (
     <div className="app-shell">
@@ -52,7 +103,7 @@ export function App() {
         selectedScrollId={store.selectedScroll?.id ?? ""}
         view={view}
         onView={setView}
-        onCreate={store.createScroll}
+        onCreate={() => setCreatingScroll(true)}
         onDelete={store.deleteScroll}
         onSelect={(id) => {
           store.selectScroll(id);
@@ -60,7 +111,13 @@ export function App() {
         }}
       />
       <main className="app-main">
-        <Topbar isGenerating={store.isGenerating || store.systemStatus.activeConcurrentJobs > 0} onOpenConsole={() => setView("console")} />
+        <Topbar
+          isGenerating={store.isGenerating || store.systemStatus.activeConcurrentJobs > 0}
+          notifications={notifications}
+          userProfile={userProfile}
+          onOpenConsole={() => setView("console")}
+          onNavigate={setView}
+        />
         {view === "workspace" && (
           <div className="workspace">
             <div className="center-column">
@@ -87,6 +144,7 @@ export function App() {
             <Inspector
               image={store.selectedImage}
               systemStatus={store.systemStatus}
+              insertDisabledReason={store.selectedScroll?.storyTemplate === AI_SCRIPT_TEMPLATE ? "编剧模式 v1 暂不支持随意插入图片，请先调整剧本帧结构。" : ""}
               onOpenViewer={() => store.selectedImage && setViewerInitialImageId(store.selectedImage.id)}
               onRegenerate={() =>
                 store.selectedImage &&
@@ -132,7 +190,24 @@ export function App() {
             }}
           />
         )}
-        {view === "settings" && <SettingsPage />}
+        {view === "archive" && (
+          <ArchivePage
+            scrolls={store.archivedScrolls}
+            images={store.archivedImages}
+            activeScrolls={store.scrolls}
+            onRestoreScroll={async (id) => {
+              await store.restoreScroll(id);
+              store.selectScroll(id);
+              setView("workspace");
+            }}
+            onPurgeScroll={store.purgeArchivedScroll}
+            onRestoreImage={async (id) => {
+              await store.restoreArchivedImage(id);
+              setView("workspace");
+            }}
+          />
+        )}
+        {view === "settings" && <SettingsPage userProfile={userProfile} onSaveProfile={saveUserProfile} />}
       </main>
       {editing && store.selectedScroll && (
         <ScrollEditDialog
@@ -144,9 +219,22 @@ export function App() {
           }}
         />
       )}
+      {creatingScroll && (
+        <CreateScrollDialog
+          onClose={() => setCreatingScroll(false)}
+          onOptimize={store.optimizePrompt}
+          onDraftScript={store.draftScript}
+          onCreate={async (input) => {
+            await store.createScroll(input);
+            setCreatingScroll(false);
+            setView("workspace");
+          }}
+        />
+      )}
       {viewerInitialImageId && (
         <ScrollPanoramaViewer images={store.images} initialImageId={viewerInitialImageId} onClose={() => setViewerInitialImageId("")} />
       )}
+      {toastNotification && <GenerationToast notification={toastNotification} onClose={() => setToastNotification(null)} />}
     </div>
   );
 }
@@ -164,36 +252,30 @@ function Sidebar({
   selectedScrollId: string;
   view: View;
   onView: (view: View) => void;
-  onCreate: (theme: string) => void;
+  onCreate: () => void;
   onDelete: (id: string) => void;
   onSelect: (id: string) => void;
 }) {
-  const [theme, setTheme] = useState("");
-
   return (
     <aside className="sidebar">
       <div className="brand">
-        <div className="brand-mark"><ScrollText size={24} /></div>
+        <div className="brand-mark"><img src="/favicon.png" alt="" /></div>
         <div>
-          <h1>AI 画卷</h1>
+          <h1>无限画卷</h1>
           <p>让 AI 持续绘制无限画卷</p>
         </div>
       </div>
       <div className="create-box">
-        <input value={theme} onChange={(event) => setTheme(event.target.value)} placeholder="输入画卷主题" />
-        <button
-          className="create-button"
-          onClick={() => {
-            onCreate(theme || "清明上河图风格");
-            setTheme("");
-          }}
-        >
+        <button className="create-button" aria-expanded="false" onClick={onCreate}>
           <Plus size={17} /> 创建画卷
         </button>
       </div>
       <nav className="main-nav">
         <button className={`nav-item ${view === "workspace" ? "active" : ""}`} onClick={() => onView("workspace")}>
           <Box size={17} /> 我的画卷
+        </button>
+        <button className={`nav-item ${view === "archive" ? "active" : ""}`} onClick={() => onView("archive")}>
+          <Archive size={17} /> 归档站
         </button>
         <button className={`nav-item ${view === "console" ? "active" : ""}`} onClick={() => onView("console")}>
           <Gauge size={17} /> 控制台
@@ -226,7 +308,7 @@ function Sidebar({
               aria-label={`删除画卷 ${scroll.title}`}
               title="删除画卷"
               onClick={() =>
-                confirmAction(`确定删除画卷「${scroll.title}」吗？此操作会删除该画卷的全部图片、任务和日志，且无法撤销。`, () => {
+                confirmAction(`确定将画卷「${scroll.title}」移入归档站吗？7 天内可以恢复，之后会自动彻底删除。`, () => {
                   void onDelete(scroll.id);
                 })
               }
@@ -240,18 +322,133 @@ function Sidebar({
   );
 }
 
-function Topbar({ isGenerating, onOpenConsole }: { isGenerating: boolean; onOpenConsole: () => void }) {
+function Topbar({
+  isGenerating,
+  notifications,
+  userProfile,
+  onOpenConsole,
+  onNavigate,
+}: {
+  isGenerating: boolean;
+  notifications: NotificationItem[];
+  userProfile: UserProfile;
+  onOpenConsole: () => void;
+  onNavigate: (view: View) => void;
+}) {
+  const [openPanel, setOpenPanel] = useState<"notifications" | "account" | null>(null);
+  const unreadCount = notifications.filter((item) => item.level === "error" || item.level === "warning").length;
+
   return (
     <header className="topbar">
       <div />
       <div className="topbar-actions">
         <span className="service-pill"><span />{isGenerating ? "正在生成" : "服务运行中"}</span>
         <button className="outline-button" onClick={onOpenConsole}><List size={16} /> 控制台</button>
-        <button className="icon-button" aria-label="通知"><Bell size={17} /></button>
-        <div className="avatar">Y</div>
-        <span className="username">Yuer</span>
+        <div className="topbar-menu">
+          <button
+            className={`icon-button notification-button ${openPanel === "notifications" ? "active" : ""}`}
+            aria-label="通知"
+            onClick={() => setOpenPanel(openPanel === "notifications" ? null : "notifications")}
+          >
+            <Bell size={17} />
+            {unreadCount > 0 && <span className="notification-dot">{unreadCount}</span>}
+          </button>
+          {openPanel === "notifications" && (
+            <NotificationPanel
+              notifications={notifications}
+              onNavigate={(nextView) => {
+                onNavigate(nextView);
+                setOpenPanel(null);
+              }}
+            />
+          )}
+        </div>
+        <div className="topbar-menu">
+          <button
+            className={`account-trigger ${openPanel === "account" ? "active" : ""}`}
+            onClick={() => setOpenPanel(openPanel === "account" ? null : "account")}
+          >
+            <UserAvatar profile={userProfile} />
+            <span className="username">{userProfile.displayName}</span>
+          </button>
+          {openPanel === "account" && (
+            <AccountMenu
+              userProfile={userProfile}
+              onNavigate={(nextView) => {
+                onNavigate(nextView);
+                setOpenPanel(null);
+              }}
+            />
+          )}
+        </div>
       </div>
     </header>
+  );
+}
+
+function NotificationPanel({ notifications, onNavigate }: { notifications: NotificationItem[]; onNavigate: (view: View) => void }) {
+  return (
+    <section className="topbar-popover notification-panel">
+      <div className="popover-title">
+        <strong>通知中心</strong>
+        <span>{notifications.length} 条</span>
+      </div>
+      {notifications.length ? (
+        <div className="notification-list">
+          {notifications.map((item) => (
+            <button key={item.id} className={`notification-item ${item.level}`} onClick={() => onNavigate(item.action)}>
+              <span className="notification-level" />
+              <span>
+                <strong>{item.title}</strong>
+                <small>{item.detail}</small>
+                <time>{formatClock(item.createdAt)}</time>
+              </span>
+            </button>
+          ))}
+        </div>
+      ) : (
+        <p className="hint">当前没有新的生成通知。</p>
+      )}
+      <button className="popover-footer" onClick={() => onNavigate("logs")}>查看全部日志</button>
+    </section>
+  );
+}
+
+function AccountMenu({ userProfile, onNavigate }: { userProfile: UserProfile; onNavigate: (view: View) => void }) {
+  return (
+    <section className="topbar-popover account-panel">
+      <div className="account-card">
+        <UserAvatar profile={userProfile} size="large" />
+        <div>
+          <strong>{userProfile.displayName}</strong>
+          <p>{userProfile.email}</p>
+        </div>
+      </div>
+      <button onClick={() => onNavigate("settings")}>账号中心</button>
+      <button onClick={() => onNavigate("logs")}>通知记录</button>
+      <button onClick={() => onNavigate("console")}>任务控制台</button>
+    </section>
+  );
+}
+
+function UserAvatar({ profile, size = "default" }: { profile: UserProfile; size?: "default" | "large" | "preview" }) {
+  const initials = profile.displayName.trim().slice(0, 1).toUpperCase() || "U";
+  return (
+    <span className={`avatar ${size === "default" ? "" : size}`}>
+      {profile.avatarUrl ? <img src={profile.avatarUrl} alt="" /> : initials}
+    </span>
+  );
+}
+
+function GenerationToast({ notification, onClose }: { notification: NotificationItem; onClose: () => void }) {
+  return (
+    <aside className="generation-toast" role="status">
+      <div>
+        <strong>{notification.title}</strong>
+        <p>{notification.detail}</p>
+      </div>
+      <button className="ghost-icon" aria-label="关闭通知" onClick={onClose}><X size={15} /></button>
+    </aside>
   );
 }
 
@@ -393,6 +590,14 @@ export function GenerationPlan({ scroll, jobs, images }: { scroll?: Scroll; jobs
               </div>
             </div>
             <dl className="creative-plan-list">
+              {item.creativePlan.mode === "story" && (
+                <>
+                  <div><dt>剧情进度</dt><dd>第 {item.creativePlan.storyFrameIndex} / {item.creativePlan.storyTotalFrames} 帧</dd></div>
+                  <div><dt>章节</dt><dd>{item.creativePlan.chapter ?? "西游记主线"}</dd></div>
+                  <div><dt>人物</dt><dd>{item.creativePlan.characters?.join("、") || "按剧情帧设定"}</dd></div>
+                  <div><dt>地点</dt><dd>{item.creativePlan.location ?? "按剧情帧设定"}</dd></div>
+                </>
+              )}
               <div><dt>衔接锚点</dt><dd>{item.creativePlan.continuityAnchor}</dd></div>
               <div><dt>新增画面</dt><dd>{item.creativePlan.newScene}</dd></div>
               <div><dt>构图节奏</dt><dd>{item.creativePlan.composition}</dd></div>
@@ -439,6 +644,7 @@ function Inspector({
   onRegenerate,
   onDelete,
   onInsert,
+  insertDisabledReason = "",
 }: {
   image?: ScrollImage;
   systemStatus: ReturnType<typeof useInfiniteScrollStore>["systemStatus"];
@@ -446,6 +652,7 @@ function Inspector({
   onRegenerate: () => void;
   onDelete: () => void;
   onInsert: (side: "before" | "after") => void;
+  insertDisabledReason?: string;
 }) {
   if (!image) return <aside className="inspector"><div className="panel empty-inspector">当前画卷还没有图片。</div></aside>;
 
@@ -465,9 +672,10 @@ function Inspector({
         <div className="action-grid">
           <button onClick={onOpenViewer}><Maximize2 size={18} />放大查看</button>
           <button onClick={onRegenerate}><RefreshCw size={18} />重新生成</button>
-          <button onClick={() => onInsert("before")}><ImagePlus size={18} />在前插入</button>
-          <button onClick={() => onInsert("after")}><ImagePlus size={18} />在后插入</button>
+          <button onClick={() => onInsert("before")} disabled={Boolean(insertDisabledReason)} title={insertDisabledReason || "在前插入"}><ImagePlus size={18} />在前插入</button>
+          <button onClick={() => onInsert("after")} disabled={Boolean(insertDisabledReason)} title={insertDisabledReason || "在后插入"}><ImagePlus size={18} />在后插入</button>
         </div>
+        {insertDisabledReason && <p className="dialog-status">{insertDisabledReason}</p>}
         <button className="delete-button" onClick={onDelete}><Trash2 size={17} /> 删除</button>
         <div className="divider" />
         <h4>图片信息</h4>
@@ -648,18 +856,456 @@ function LogsPage({ scrolls, logs, onSelectScroll }: { scrolls: Scroll[]; logs: 
   );
 }
 
-function SettingsPage() {
+function ArchivePage({
+  scrolls,
+  images,
+  activeScrolls,
+  onRestoreScroll,
+  onPurgeScroll,
+  onRestoreImage,
+}: {
+  scrolls: Scroll[];
+  images: ScrollImage[];
+  activeScrolls: Scroll[];
+  onRestoreScroll: (id: string) => void | Promise<void>;
+  onPurgeScroll: (id: string) => void | Promise<void>;
+  onRestoreImage: (id: string) => void | Promise<void>;
+}) {
+  const scrollTitleById = new Map(activeScrolls.map((scroll) => [scroll.id, scroll.title]));
+  const total = scrolls.length + images.length;
+
+  return (
+    <main className="console-page archive-page">
+      <section className="console-hero panel">
+        <div>
+          <h2>归档站</h2>
+          <p>删除的画卷和图片会先暂存在这里，7 天后自动彻底清理。</p>
+        </div>
+        <div className="console-metrics">
+          <Metric label="归档画卷" value={`${scrolls.length}`} />
+          <Metric label="归档图片" value={`${images.length}`} />
+          <Metric label="保留天数" value="7" />
+        </div>
+      </section>
+      {scrolls.length > 0 && (
+        <>
+          <div className="section-title"><h3>画卷</h3></div>
+          <section className="archive-grid">
+            {scrolls.map((scroll) => (
+              <article key={scroll.id} className="panel archive-card">
+                <img src={scroll.thumbnail} alt="" />
+                <div className="archive-card-body">
+                  <div>
+                    <h3>{scroll.title}</h3>
+                    <p>{scroll.imageCount} 张图片</p>
+                  </div>
+                  <dl className="archive-meta">
+                    <div><dt>归档时间</dt><dd>{scroll.archivedAt ? formatDateMinute(scroll.archivedAt) : "未知"}</dd></div>
+                    <div><dt>彻底删除</dt><dd>{scroll.purgeAfter ? formatDateMinute(scroll.purgeAfter) : "7 天后"}</dd></div>
+                  </dl>
+                  <div className="archive-actions">
+                    <button className="small-button" onClick={() => void onRestoreScroll(scroll.id)}>恢复</button>
+                    <button
+                      className="small-button danger"
+                      onClick={() =>
+                        confirmAction(`确定彻底删除画卷「${scroll.title}」吗？此操作会删除全部图片、任务和日志，且无法撤销。`, () => {
+                          void onPurgeScroll(scroll.id);
+                        })
+                      }
+                    >
+                      彻底删除
+                    </button>
+                  </div>
+                </div>
+              </article>
+            ))}
+          </section>
+        </>
+      )}
+      {images.length > 0 && (
+        <>
+          <div className="section-title"><h3>图片</h3></div>
+          <section className="archive-grid">
+            {images.map((image) => (
+              <article key={image.id} className="panel archive-card">
+                <img src={image.src} alt="" />
+                <div className="archive-card-body">
+                  <div>
+                    <h3>第 {image.index} 张图片</h3>
+                    <p>{scrollTitleById.get(image.scrollId) ?? "原画卷"}</p>
+                  </div>
+                  <dl className="archive-meta">
+                    <div><dt>原位置</dt><dd>第 {image.index} 张</dd></div>
+                    <div><dt>归档时间</dt><dd>{image.archivedAt ? formatDateMinute(image.archivedAt) : "未知"}</dd></div>
+                    <div><dt>彻底删除</dt><dd>{image.purgeAfter ? formatDateMinute(image.purgeAfter) : "7 天后"}</dd></div>
+                  </dl>
+                  <div className="archive-actions">
+                    <button className="small-button" onClick={() => void onRestoreImage(image.id)}>恢复到原位置</button>
+                  </div>
+                </div>
+              </article>
+            ))}
+          </section>
+        </>
+      )}
+      {total === 0 && (
+        <section className="panel archive-empty">
+          <Archive size={24} />
+          <p>暂无归档内容。</p>
+        </section>
+      )}
+    </main>
+  );
+}
+
+function SettingsPage({ userProfile, onSaveProfile }: { userProfile: UserProfile; onSaveProfile: (profile: UserProfile) => void }) {
+  const [draft, setDraft] = useState(userProfile);
+
+  useEffect(() => {
+    setDraft(userProfile);
+  }, [userProfile]);
+
+  const hasChanges = JSON.stringify(draft) !== JSON.stringify(userProfile);
+  const handleAvatarFile = (file: File | undefined) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") setDraft((current) => ({ ...current, avatarUrl: reader.result as string }));
+    };
+    reader.readAsDataURL(file);
+  };
+
   return (
     <main className="console-page">
       <section className="panel console-hero">
-        <div><h2>设置</h2><p>画面比例固定为 4:3；衔接覆盖是拼接用的参考区，不再当作图片比例展示。</p></div>
+        <div><h2>用户中心</h2><p>管理账号资料、头像和生成通知偏好。</p></div>
       </section>
-      <section className="panel">
-        <h3>衔接比例</h3>
-        <div className="preset-row"><span className="preset-button active">统一覆盖 {Math.round(FIXED_OVERLAP_RATIO * 100)}%</span></div>
-        <p className="hint">真实图片和预览标签都会显示 4:3；覆盖比例只用于保证左右衔接稳定。</p>
-      </section>
+      <div className="settings-grid">
+        <section className="panel account-settings">
+          <div className="account-card large-card">
+            <UserAvatar profile={draft} size="preview" />
+            <div>
+              <h3>{draft.displayName}</h3>
+              <p>{draft.role} / {draft.email}</p>
+            </div>
+          </div>
+          <div className="avatar-controls">
+            <label>
+              头像 URL
+              <input value={draft.avatarUrl} onChange={(event) => setDraft({ ...draft, avatarUrl: event.target.value })} placeholder="https://..." />
+            </label>
+            <div className="avatar-actions">
+              <label className="small-button file-button">
+                选择图片
+                <input type="file" accept="image/*" onChange={(event) => handleAvatarFile(event.target.files?.[0])} />
+              </label>
+              <button className="small-button" type="button" onClick={() => setDraft({ ...draft, avatarUrl: "" })}>清除头像</button>
+            </div>
+          </div>
+          <label>
+            昵称
+            <input value={draft.displayName} onChange={(event) => setDraft({ ...draft, displayName: event.target.value })} />
+          </label>
+          <label>
+            邮箱
+            <input value={draft.email} onChange={(event) => setDraft({ ...draft, email: event.target.value })} />
+          </label>
+          <label>
+            角色
+            <input value={draft.role} onChange={(event) => setDraft({ ...draft, role: event.target.value })} />
+          </label>
+          <button className="create-button" disabled={!hasChanges} onClick={() => onSaveProfile(draft)}>
+            <Save size={16} /> 保存账号资料
+          </button>
+        </section>
+        <section className="panel preference-panel">
+          <h3>通知偏好</h3>
+          <PreferenceToggle
+            title="图片生成成功"
+            detail="新图片生成并同步到 Supabase 后提醒我。"
+            checked={draft.notifications.generationSuccess}
+            onChange={(checked) => setDraft({ ...draft, notifications: { ...draft.notifications, generationSuccess: checked } })}
+          />
+          <PreferenceToggle
+            title="生成失败或上传异常"
+            detail="任务失败、Storage 上传失败或接口异常时优先提醒。"
+            checked={draft.notifications.generationFailure}
+            onChange={(checked) => setDraft({ ...draft, notifications: { ...draft.notifications, generationFailure: checked } })}
+          />
+          <PreferenceToggle
+            title="队列与下一张计划"
+            detail="显示下一张画卷片段的队列状态和触发提醒。"
+            checked={draft.notifications.queueReminder}
+            onChange={(checked) => setDraft({ ...draft, notifications: { ...draft.notifications, queueReminder: checked } })}
+          />
+        </section>
+      </div>
     </main>
+  );
+}
+
+function PreferenceToggle({
+  title,
+  detail,
+  checked,
+  onChange,
+}: {
+  title: string;
+  detail: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <label className="preference-toggle">
+      <span>
+        <strong>{title}</strong>
+        <small>{detail}</small>
+      </span>
+      <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} />
+    </label>
+  );
+}
+
+function CreateScrollDialog({
+  onClose,
+  onOptimize,
+  onDraftScript,
+  onCreate,
+}: {
+  onClose: () => void;
+  onOptimize: (theme: string) => Promise<string>;
+  onDraftScript: (input: { theme: string; frameCount: number; requirements: string; stylePrompt: string }) => Promise<ScriptDraft | null>;
+  onCreate: (input: {
+    theme: string;
+    optimizedPrompt: string;
+    generationMode?: "free" | "story";
+    storyTemplate?: string | null;
+    storyTemplateVersion?: string | null;
+    storyTotalFrames?: number | null;
+    scriptSummary?: string;
+    characterBible?: string;
+    storyFrames?: ScriptFrame[];
+  }) => Promise<void>;
+}) {
+  const [theme, setTheme] = useState("");
+  const [optimizedPrompt, setOptimizedPrompt] = useState("");
+  const [requirements, setRequirements] = useState("");
+  const [scriptMode, setScriptMode] = useState(false);
+  const [frameCount, setFrameCount] = useState(DEFAULT_SCRIPT_FRAME_COUNT);
+  const [draft, setDraft] = useState<ScriptDraft | null>(null);
+  const [status, setStatus] = useState("输入主题后可创建自由画卷，也可以开启编剧模式先生成完整分镜。");
+  const [error, setError] = useState("");
+  const [isOptimizing, setIsOptimizing] = useState(false);
+  const [isDrafting, setIsDrafting] = useState(false);
+  const [isCreating, setIsCreating] = useState(false);
+  const themeInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    themeInputRef.current?.focus();
+  }, []);
+
+  async function optimizeTheme() {
+    const cleanTheme = theme.trim();
+    if (!cleanTheme) {
+      setError("请输入你想生成的画卷主题");
+      themeInputRef.current?.focus();
+      return;
+    }
+
+    setError("");
+    setIsOptimizing(true);
+    setStatus("DeepSeek 正在理解你的主题，并扩展为连续画卷提示词...");
+    const nextPrompt = await onOptimize(cleanTheme);
+    setIsOptimizing(false);
+
+    if (!nextPrompt.trim()) {
+      setError("DeepSeek 暂时没有返回有效提示词，请稍后重试或手动填写。");
+      setStatus("可以重试扩写，也可以直接手动填写提示词。");
+      return;
+    }
+
+    setOptimizedPrompt(nextPrompt);
+    setStatus("DeepSeek 已完成扩写，你可以继续修改，确认满意后再创建画卷。");
+  }
+
+  async function draftScript() {
+    const cleanTheme = theme.trim();
+    if (!cleanTheme) {
+      setError("请输入你想生成的画卷主题");
+      themeInputRef.current?.focus();
+      return;
+    }
+    setError("");
+    setIsDrafting(true);
+    setStatus("DeepSeek 正在规划完整剧本分镜...");
+    const nextDraft = await onDraftScript({ theme: cleanTheme, frameCount, requirements, stylePrompt: optimizedPrompt });
+    setIsDrafting(false);
+    if (!nextDraft) {
+      setError("DeepSeek 暂时没有返回有效剧本，请稍后重试。");
+      return;
+    }
+    setDraft(nextDraft);
+    setOptimizedPrompt(nextDraft.visualStyle || optimizedPrompt);
+    setStatus("剧本草稿已生成，你可以检查并修改分镜后创建空白画卷。");
+  }
+
+  async function createScroll() {
+    const cleanTheme = theme.trim();
+    if (!cleanTheme) {
+      setError("请输入你想生成的画卷主题");
+      themeInputRef.current?.focus();
+      return;
+    }
+    if (!scriptMode && !optimizedPrompt.trim()) {
+      setError("请先让 DeepSeek 丰富提示词，或手动填写完整提示词后再确认创建。");
+      return;
+    }
+    if (scriptMode && !draft) {
+      setError("请先生成剧本草稿，再确认创建。");
+      return;
+    }
+
+    setError("");
+    setIsCreating(true);
+    setStatus("正在创建画卷...");
+    await onCreate(
+      scriptMode && draft
+        ? {
+            theme: cleanTheme,
+            optimizedPrompt: optimizedPrompt || draft.visualStyle,
+            generationMode: "story",
+            storyTemplate: AI_SCRIPT_TEMPLATE,
+            storyTemplateVersion: AI_SCRIPT_TEMPLATE_VERSION,
+            storyTotalFrames: draft.frames.length,
+            scriptSummary: draft.summary,
+            characterBible: draft.characterBible,
+            storyFrames: draft.frames,
+          }
+        : { theme: cleanTheme, optimizedPrompt },
+    );
+    setIsCreating(false);
+  }
+
+  function updateFrame(index: number, patch: Partial<ScriptFrame>) {
+    setDraft((current) =>
+      current
+        ? {
+            ...current,
+            frames: current.frames.map((frame, frameIndex) => (frameIndex === index ? { ...frame, ...patch } : frame)),
+          }
+        : current,
+    );
+  }
+
+  const busy = isOptimizing || isDrafting || isCreating;
+
+  return (
+    <div className="create-dialog-backdrop">
+      <section className="create-scroll-dialog" role="dialog" aria-modal="true" aria-labelledby="create-scroll-title">
+        <header className="create-dialog-header">
+          <div>
+            <h3 id="create-scroll-title">创建新画卷</h3>
+            <p>自由画卷可以直接扩写提示词；编剧模式会先生成可编辑长剧本。</p>
+          </div>
+          <button className="ghost-icon" aria-label="关闭创建画卷" onClick={onClose} disabled={busy}>
+            <X size={17} />
+          </button>
+        </header>
+        <div className="create-dialog-body">
+          <aside className="create-dialog-aside">
+            <strong>创建流程</strong>
+            <span>1. 输入主题和补充要求</span>
+            <span>2. 选择自由画卷或编剧模式</span>
+            <span>3. 编剧模式先生成并编辑分镜</span>
+            <span>4. 确认创建空白画卷</span>
+          </aside>
+          <div className="create-dialog-form">
+            <label className="dialog-label">
+              输入你想生成的画卷主题
+              <input
+                ref={themeInputRef}
+                value={theme}
+                onChange={(event) => {
+                  setTheme(event.target.value);
+                  if (error) setError("");
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") void optimizeTheme();
+                  if (event.key === "Escape" && !busy) onClose();
+                }}
+                placeholder="例如：宋代汴京雨夜市集、海底丝绸之路、赛博敦煌夜市"
+              />
+            </label>
+            <label className="dialog-label">
+              补充要求
+              <textarea value={requirements} onChange={(event) => setRequirements(event.target.value)} placeholder="例如：主角是少年与机械鸟，剧情偏温暖冒险，不要恐怖元素。" />
+            </label>
+            <label className="dialog-check">
+              <input type="checkbox" checked={scriptMode} onChange={(event) => setScriptMode(event.target.checked)} />
+              开启编剧模式：先由 DeepSeek 规划完整剧本，再逐帧生成
+            </label>
+            <label className="dialog-label">
+              剧本长度
+              <select value={frameCount} onChange={(event) => setFrameCount(Number(event.target.value))} disabled={!scriptMode}>
+                {SCRIPT_FRAME_COUNTS.map((count) => (
+                  <option key={count} value={count}>{count} 帧</option>
+                ))}
+              </select>
+            </label>
+            <button className="create-button" onClick={() => void optimizeTheme()} disabled={isOptimizing || isCreating}>
+              {isOptimizing ? <Loader2 size={17} className="spin" /> : <RefreshCw size={17} />}
+              让 DeepSeek 丰富提示词
+            </button>
+            <label className="dialog-label">
+              DeepSeek 生成的画卷提示词
+              <textarea
+                value={optimizedPrompt}
+                onChange={(event) => {
+                  setOptimizedPrompt(event.target.value);
+                  if (error) setError("");
+                }}
+                placeholder="DeepSeek 扩写后的提示词会出现在这里，你可以继续编辑。"
+              />
+            </label>
+            <button className="create-button" onClick={() => void draftScript()} disabled={busy || !scriptMode}>
+              {isDrafting ? <Loader2 size={17} className="spin" /> : <ScrollText size={17} />}
+              生成长剧本分镜
+            </button>
+            {scriptMode && draft && (
+              <div className="script-draft-panel">
+                <strong>{draft.title}</strong>
+                <p>{draft.summary}</p>
+                <p>{draft.characterBible}</p>
+                <div className="script-frame-list">
+                  {draft.frames.map((frame, index) => (
+                    <div className="script-frame-editor" key={frame.frameIndex}>
+                      <span>第 {frame.frameIndex} / {draft.frames.length} 帧</span>
+                      <input value={frame.title} onChange={(event) => updateFrame(index, { title: event.target.value })} />
+                      <input value={frame.chapter} onChange={(event) => updateFrame(index, { chapter: event.target.value })} />
+                      <textarea value={frame.scene} onChange={(event) => updateFrame(index, { scene: event.target.value })} />
+                      <input value={frame.characters.join("、")} onChange={(event) => updateFrame(index, { characters: event.target.value.split(/[、,，]/).map((item) => item.trim()).filter(Boolean) })} />
+                      <input value={frame.location} onChange={(event) => updateFrame(index, { location: event.target.value })} />
+                      <input value={frame.mood} onChange={(event) => updateFrame(index, { mood: event.target.value })} />
+                      <textarea value={frame.forbidden} onChange={(event) => updateFrame(index, { forbidden: event.target.value })} />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            <p className={`dialog-status ${error ? "error" : ""}`}>{error || status}</p>
+          </div>
+        </div>
+        <footer className="dialog-actions">
+          <button className="small-button" onClick={onClose} disabled={busy}>
+            取消
+          </button>
+          <button className="create-button" onClick={() => void createScroll()} disabled={busy}>
+            {isCreating ? <Loader2 size={17} className="spin" /> : <CheckCircle2 size={17} />}
+            确认创建画卷
+          </button>
+        </footer>
+      </section>
+    </div>
   );
 }
 
@@ -702,7 +1348,7 @@ function ScrollPanoramaViewer({
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
 
-  const scrollHeight = Math.min(420, Math.max(210, viewport.height * 0.46));
+  const scrollHeight = computeImmersiveScrollHeight(viewport.height);
   const layout = useMemo(() => computeSegmentLayout(images, scrollHeight), [images, scrollHeight]);
   const activeIndex = Math.max(0, images.findIndex((image) => image.id === initialImageId));
 
@@ -803,6 +1449,18 @@ function ScrollPanoramaViewer({
     [resetView, scale, updateScaleAroundPoint],
   );
 
+  const zoomFromCenter = useCallback(
+    (nextScale: number) => {
+      if (!stageRef.current) {
+        setScale(clampScale(nextScale));
+        return;
+      }
+      const rect = stageRef.current.getBoundingClientRect();
+      updateScaleAroundPoint(nextScale, rect.left + rect.width / 2, rect.top + rect.height / 2);
+    },
+    [updateScaleAroundPoint],
+  );
+
   const handleMouseDown = useCallback(
     (event: React.MouseEvent) => {
       event.preventDefault();
@@ -835,6 +1493,17 @@ function ScrollPanoramaViewer({
           </span>
         </div>
         <div className="panorama-actions">
+          <button onClick={() => zoomFromCenter(scale - 0.25)} aria-label="缩小">
+            <Minus size={16} />
+            缩小
+          </button>
+          <button onClick={() => zoomFromCenter(1)} aria-label="一比一">
+            1:1
+          </button>
+          <button onClick={() => zoomFromCenter(scale + 0.25)} aria-label="放大">
+            <Plus size={16} />
+            放大
+          </button>
           <button onClick={resetView}>
             <RefreshCw size={16} />
             重置

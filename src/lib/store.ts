@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { mockImages, mockJobs, mockLogs, mockScrolls, mockSystemStatus } from "../data/mockData";
-import { createCreativePlan } from "./creativePlan";
+import { calculatePurgeAfter, partitionArchivedImages, partitionArchivedScrolls } from "./archive";
+import { buildCreateScrollPayload, detectGenerationMode } from "./createScrollFlow";
 import { FIXED_OVERLAP_PRESET, FIXED_OVERLAP_RATIO } from "./stitching";
 import { planImageDeletion, shouldRegenerateImmediately } from "./imageOperations";
 import { chooseScrollAfterDeletion } from "./scrollManagement";
@@ -8,11 +9,32 @@ import { deriveSystemStatus } from "./systemStatus";
 import { isSupabaseConfigured, supabase } from "./supabaseClient";
 import { mapImageRow, mapJobRow, mapLogRow, mapScrollRow } from "./supabaseMappers";
 import type { GenerationJob, GenerationLog, Scroll, ScrollImage, SystemStatus } from "../types";
+import { AI_SCRIPT_TEMPLATE, scriptFrameToInsert, type ScriptDraft, type ScriptFrame } from "./scriptDraft";
 
 type DataMode = "loading" | "supabase" | "mock";
 
 type CreateScrollApiResponse = {
   scroll?: Record<string, unknown>;
+};
+
+type CreateScrollInput = {
+  theme: string;
+  optimizedPrompt: string;
+  generationMode?: "free" | "story";
+  storyTemplate?: string | null;
+  storyTemplateVersion?: string | null;
+  storyTotalFrames?: number | null;
+  scriptSummary?: string;
+  characterBible?: string;
+  storyFrames?: ScriptFrame[];
+};
+
+type OptimizePromptApiResponse = {
+  optimizedPrompt?: string;
+};
+
+type ScriptDraftApiResponse = {
+  draft?: ScriptDraft;
 };
 
 type UpdateScrollApiResponse = {
@@ -168,13 +190,15 @@ export function useInfiniteScrollStore() {
 
     if (!nextScrolls.length) return;
 
-    const currentScrollStillExists = keepSelection && nextScrolls.some((scroll) => scroll.id === selectedScrollId);
-    const nextSelectedScrollId = currentScrollStillExists ? selectedScrollId : nextScrolls[0].id;
+    const activeScrolls = nextScrolls.filter((scroll) => !scroll.archivedAt);
+    const currentScrollStillExists = keepSelection && activeScrolls.some((scroll) => scroll.id === selectedScrollId);
+    const nextSelectedScrollId = currentScrollStillExists ? selectedScrollId : (activeScrolls[0]?.id ?? "");
     setSelectedScrollId(nextSelectedScrollId);
 
-    const currentImageStillExists = keepSelection && nextImages.some((image) => image.id === selectedImageId);
+    const activeImages = nextImages.filter((image) => !image.archivedAt);
+    const currentImageStillExists = keepSelection && activeImages.some((image) => image.id === selectedImageId);
     if (!currentImageStillExists) {
-      const firstImage = nextImages.find((image) => image.scrollId === nextSelectedScrollId);
+      const firstImage = activeImages.find((image) => image.scrollId === nextSelectedScrollId);
       if (firstImage) setSelectedImageId(firstImage.id);
     }
   }
@@ -193,10 +217,12 @@ export function useInfiniteScrollStore() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const selectedScroll = scrolls.find((scroll) => scroll.id === selectedScrollId) ?? scrolls[0];
+  const partitionedScrolls = useMemo(() => partitionArchivedScrolls(scrolls), [scrolls]);
+  const partitionedImages = useMemo(() => partitionArchivedImages(images), [images]);
+  const selectedScroll = partitionedScrolls.active.find((scroll) => scroll.id === selectedScrollId) ?? partitionedScrolls.active[0];
   const scrollImages = useMemo(
-    () => (selectedScroll ? images.filter((image) => image.scrollId === selectedScroll.id).sort((a, b) => a.index - b.index) : []),
-    [images, selectedScroll],
+    () => (selectedScroll ? partitionedImages.active.filter((image) => image.scrollId === selectedScroll.id).sort((a, b) => a.index - b.index) : []),
+    [partitionedImages.active, selectedScroll],
   );
   const selectedImage = scrollImages.find((image) => image.id === selectedImageId) ?? scrollImages[0];
   const scrollJobs = selectedScroll ? jobs.filter((job) => job.scrollId === selectedScroll.id).sort((a, b) => a.targetIndex - b.targetIndex) : [];
@@ -259,16 +285,34 @@ export function useInfiniteScrollStore() {
     await loadRemoteData();
   }
 
-  async function createScroll(theme: string) {
-    const cleanTheme = theme.trim();
+  async function createScroll(input: CreateScrollInput) {
+    const payload = buildCreateScrollPayload(input);
+    const cleanTheme = payload.theme;
+    const optimizedPrompt = payload.optimizedPrompt;
+    const storyMode =
+      input.generationMode === "story" && input.storyTemplate
+        ? {
+            generationMode: "story" as const,
+            storyTemplate: input.storyTemplate,
+            storyTemplateVersion: input.storyTemplateVersion ?? "v1",
+            storyTotalFrames: input.storyTotalFrames ?? input.storyFrames?.length ?? null,
+          }
+        : detectGenerationMode(cleanTheme, optimizedPrompt);
     if (!cleanTheme) return;
-    setDataMessage("正在创建画卷并优化提示词...");
+    setDataMessage("正在创建空白画卷...");
 
     try {
       const response = await fetch("/api/scrolls/create", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ theme: cleanTheme }),
+        body: JSON.stringify({
+          theme: cleanTheme,
+          optimizedPrompt,
+          ...storyMode,
+          scriptSummary: input.scriptSummary,
+          characterBible: input.characterBible,
+          storyFrames: input.storyFrames,
+        }),
       });
       if (response.ok) {
         const payload = (await response.json()) as CreateScrollApiResponse;
@@ -281,23 +325,27 @@ export function useInfiniteScrollStore() {
     }
 
     if (dataMode === "supabase" && supabase) {
-      const now = new Date().toISOString();
       const nextRunAt = new Date(Date.now() + 300000).toISOString();
-      const optimizedPrompt = `以「${cleanTheme}」为主题生成连续横向画卷，保持风格、光照、空间透视和左到右叙事连续。`;
       const { data, error } = await supabase
         .from("scrolls")
         .insert({
           title: `${cleanTheme.slice(0, 12)}画卷`,
           original_theme: cleanTheme,
           optimized_prompt: optimizedPrompt,
-          status: "generating",
-          auto_generation_enabled: true,
+          generation_mode: storyMode.generationMode,
+          story_template: storyMode.storyTemplate,
+          story_template_version: storyMode.storyTemplateVersion,
+          story_total_frames: storyMode.storyTotalFrames,
+          script_summary: input.scriptSummary ?? null,
+          character_bible: input.characterBible ?? null,
+          status: "paused",
+          auto_generation_enabled: false,
           interval_minutes: 5,
           overlap_preset: FIXED_OVERLAP_PRESET,
           overlap_ratio: FIXED_OVERLAP_RATIO,
           image_count: 0,
           next_run_at: nextRunAt,
-          last_generated_at: now,
+          last_generated_at: null,
           thumbnail_url: "/assets/scroll-segment.svg",
         })
         .select()
@@ -308,20 +356,15 @@ export function useInfiniteScrollStore() {
         return;
       }
 
-      await supabase.from("generation_jobs").insert({
-        scroll_id: data.id,
-        target_index: 1,
-        type: "auto_next",
-        status: "queued",
-        scheduled_for: nextRunAt,
-        creative_plan: createCreativePlan({
-          theme: cleanTheme,
-          optimizedPrompt,
-          targetIndex: 1,
-          hasReferenceImage: false,
-        }),
-      });
-      await addLog("画卷已创建", "第一张图片任务已进入队列", "success", data.id);
+      if (storyMode.storyTemplate === AI_SCRIPT_TEMPLATE && input.storyFrames?.length) {
+        const { error: frameError } = await supabase.from("scroll_story_frames").insert(input.storyFrames.map((frame) => scriptFrameToInsert(data.id, frame)));
+        if (frameError) {
+          setDataMessage(`剧本分镜写入失败：${frameError.message}`);
+          return;
+        }
+      }
+
+      await addLog("空白画卷已创建", "尚未生成图片。点击立即生成或开启自动生成后开始绘制。", "success", data.id);
       await loadRemoteData(false);
       setSelectedScrollId(data.id);
       return;
@@ -331,9 +374,15 @@ export function useInfiniteScrollStore() {
     const newScroll: Scroll = {
       id,
       title: `${cleanTheme.slice(0, 12)}画卷`,
-      status: "generating",
+      status: "paused",
       originalTheme: cleanTheme,
-      optimizedPrompt: `以「${cleanTheme}」为主题生成连续横向画卷，保持统一风格。`,
+      optimizedPrompt,
+      generationMode: storyMode.generationMode,
+      storyTemplate: storyMode.storyTemplate,
+      storyTemplateVersion: storyMode.storyTemplateVersion,
+      storyTotalFrames: storyMode.storyTotalFrames,
+      scriptSummary: input.scriptSummary ?? null,
+      characterBible: input.characterBible ?? null,
       createdAt: new Date().toISOString(),
       lastGeneratedAt: new Date().toISOString(),
       nextRunAt: new Date(Date.now() + 300000).toISOString(),
@@ -341,11 +390,51 @@ export function useInfiniteScrollStore() {
       overlapPreset: FIXED_OVERLAP_PRESET,
       overlapRatio: FIXED_OVERLAP_RATIO,
       imageCount: 0,
-      autoGenerationEnabled: true,
+      autoGenerationEnabled: false,
       thumbnail: "/assets/scroll-segment.svg",
     };
     setScrolls((current) => [newScroll, ...current]);
     setSelectedScrollId(id);
+  }
+
+  async function optimizePrompt(theme: string) {
+    const cleanTheme = theme.trim();
+    if (!cleanTheme) return "";
+    setDataMessage("正在使用 AI 优化画卷提示词...");
+    try {
+      const response = await fetch("/api/prompts/optimize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ theme: cleanTheme }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = (await response.json()) as OptimizePromptApiResponse;
+      setDataMessage("提示词已优化，可继续编辑后创建空白画卷。");
+      return payload.optimizedPrompt ?? "";
+    } catch (error) {
+      setDataMessage(error instanceof Error ? `提示词优化失败：${error.message}` : "提示词优化失败。");
+      return "";
+    }
+  }
+
+  async function draftScript(input: { theme: string; frameCount: number; requirements: string; stylePrompt: string }) {
+    const cleanTheme = input.theme.trim();
+    if (!cleanTheme) return null;
+    setDataMessage("DeepSeek 正在生成长剧本分镜...");
+    try {
+      const response = await fetch("/api/scripts/draft", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...input, theme: cleanTheme }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = (await response.json()) as ScriptDraftApiResponse;
+      setDataMessage("剧本草稿已生成，可检查修改后创建画卷。");
+      return payload.draft ?? null;
+    } catch (error) {
+      setDataMessage(error instanceof Error ? `剧本生成失败：${error.message}` : "剧本生成失败。");
+      return null;
+    }
   }
 
   async function generateNextImageNow() {
@@ -413,7 +502,15 @@ export function useInfiniteScrollStore() {
   async function deleteScroll(scrollId: string) {
     const scroll = scrolls.find((item) => item.id === scrollId);
     if (!scroll) return;
-    const nextSelectedScrollId = chooseScrollAfterDeletion(scrolls, scrollId, selectedScrollId);
+    const nextSelectedScrollId = chooseScrollAfterDeletion(partitionedScrolls.active, scrollId, selectedScrollId);
+    const archivedAt = new Date().toISOString();
+    const archivedScroll: Scroll = {
+      ...scroll,
+      archivedAt,
+      purgeAfter: calculatePurgeAfter(archivedAt),
+      autoGenerationEnabled: false,
+      status: "paused",
+    };
 
     if (dataMode === "supabase" && !scrollId.startsWith("scroll-")) {
       try {
@@ -424,20 +521,76 @@ export function useInfiniteScrollStore() {
         });
         if (!response.ok) throw new Error(await response.text());
       } catch (error) {
-        setDataMessage(error instanceof Error ? `删除画卷失败：${error.message}` : "删除画卷失败。");
+        setDataMessage(error instanceof Error ? `归档画卷失败：${error.message}` : "归档画卷失败。");
         return;
       }
+    }
+
+    setScrolls((current) => current.map((item) => (item.id === scrollId ? archivedScroll : item)));
+    setSelectedScrollId(nextSelectedScrollId);
+    const nextImage = images.find((image) => image.scrollId === nextSelectedScrollId);
+    setSelectedImageId(nextImage?.id ?? "");
+    setDataMessage(`画卷「${scroll.title}」已移入归档站，7 天后自动彻底删除。`);
+
+    if (dataMode === "supabase") await loadRemoteData(false);
+  }
+
+  async function restoreScroll(scrollId: string) {
+    try {
+      const response = await fetch("/api/scrolls/restore", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scrollId }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+    } catch (error) {
+      setDataMessage(error instanceof Error ? `恢复画卷失败：${error.message}` : "恢复画卷失败。");
+      return;
+    }
+
+    setScrolls((current) => current.map((item) => (item.id === scrollId ? { ...item, archivedAt: null, purgeAfter: null, autoGenerationEnabled: true, status: "generating" } : item)));
+    setDataMessage("画卷已恢复。");
+    await loadRemoteData(false);
+  }
+
+  async function purgeArchivedScroll(scrollId: string) {
+    try {
+      const response = await fetch("/api/scrolls/purge", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scrollId }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+    } catch (error) {
+      setDataMessage(error instanceof Error ? `彻底删除失败：${error.message}` : "彻底删除失败。");
+      return;
     }
 
     setScrolls((current) => current.filter((item) => item.id !== scrollId));
     setImages((current) => current.filter((item) => item.scrollId !== scrollId));
     setJobs((current) => current.filter((item) => item.scrollId !== scrollId));
     setLogs((current) => current.filter((item) => item.scrollId !== scrollId));
-    setSelectedScrollId(nextSelectedScrollId);
-    const nextImage = images.find((image) => image.scrollId === nextSelectedScrollId);
-    setSelectedImageId(nextImage?.id ?? "");
-    setDataMessage(nextSelectedScrollId ? `画卷「${scroll.title}」已删除。` : "画卷已删除，当前没有画卷。");
+    setDataMessage("归档画卷已彻底删除。");
+  }
+  async function restoreArchivedImage(imageId: string) {
+    const image = images.find((item) => item.id === imageId);
+    if (!image) return;
+    try {
+      const response = await fetch("/api/images/restore", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageId }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+    } catch (error) {
+      setDataMessage(error instanceof Error ? `恢复图片失败：${error.message}` : "恢复图片失败。");
+      return;
+    }
 
+    setImages((current) => current.map((item) => (item.id === imageId ? { ...item, archivedAt: null, purgeAfter: null } : item)));
+    setSelectedScrollId(image.scrollId);
+    setSelectedImageId(imageId);
+    setDataMessage(`第 ${image.index} 张图片已恢复到原位置。`);
     if (dataMode === "supabase") await loadRemoteData(false);
   }
 
@@ -497,7 +650,8 @@ export function useInfiniteScrollStore() {
         return;
       }
     } else {
-      setImages((current) => current.filter((item) => item.id !== imageId));
+      const archivedAt = new Date().toISOString();
+      setImages((current) => current.map((item) => (item.id === imageId ? { ...item, archivedAt, purgeAfter: calculatePurgeAfter(archivedAt) } : item)));
     }
 
     if (dataMode !== "supabase") {
@@ -546,7 +700,9 @@ export function useInfiniteScrollStore() {
   }
 
   return {
-    scrolls,
+    scrolls: partitionedScrolls.active,
+    archivedScrolls: partitionedScrolls.archived,
+    archivedImages: partitionedImages.archived,
     images: scrollImages,
     allImages: images,
     jobs: scrollJobs,
@@ -567,7 +723,12 @@ export function useInfiniteScrollStore() {
     insertImage,
     toggleAutoGeneration,
     createScroll,
+    optimizePrompt,
+    draftScript,
     deleteScroll,
+    restoreScroll,
+    purgeArchivedScroll,
+    restoreArchivedImage,
     generateNextImageNow,
     retryJob,
     updateScrollInfo,

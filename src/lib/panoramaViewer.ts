@@ -31,6 +31,12 @@ export function clampScale(scale: number) {
   return Math.max(MIN_PANORAMA_SCALE, Math.min(MAX_PANORAMA_SCALE, scale));
 }
 
+export function computeImmersiveScrollHeight(stageHeight: number) {
+  const safeStageHeight = Math.max(0, stageHeight);
+  const targetHeight = safeStageHeight >= 600 ? safeStageHeight - 32 : safeStageHeight - 40;
+  return Math.round(Math.min(1080, Math.max(204, targetHeight)));
+}
+
 function scaleByHeight(value: number, sourceHeight: number, targetHeight: number) {
   return Math.round((value / sourceHeight) * targetHeight);
 }

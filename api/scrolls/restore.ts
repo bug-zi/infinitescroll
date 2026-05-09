@@ -1,5 +1,4 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { calculatePurgeAfter } from "../_lib/scrollDeletion.js";
 import { createSupabaseAdmin } from "../_lib/supabaseAdmin.js";
 
 function isUuid(value: string) {
@@ -21,23 +20,20 @@ export default async function handler(request: VercelRequest, response: VercelRe
 
   try {
     const supabase = createSupabaseAdmin();
-    const archivedAt = new Date().toISOString();
-    const { error: scrollError } = await supabase
+    const { error } = await supabase
       .from("scrolls")
       .update({
-        archived_at: archivedAt,
-        purge_after: calculatePurgeAfter(archivedAt),
-        auto_generation_enabled: false,
-        status: "paused",
-        updated_at: archivedAt,
+        archived_at: null,
+        purge_after: null,
+        auto_generation_enabled: true,
+        status: "generating",
+        updated_at: new Date().toISOString(),
       })
       .eq("id", scrollId);
-    if (scrollError) throw scrollError;
+    if (error) throw error;
 
-    response.status(200).json({ ok: true, scrollId, archivedAt, purgeAfter: calculatePurgeAfter(archivedAt) });
+    response.status(200).json({ ok: true, scrollId });
   } catch (error) {
-    response.status(500).json({
-      error: error instanceof Error ? error.message : "Delete scroll failed",
-    });
+    response.status(500).json({ error: error instanceof Error ? error.message : "Restore scroll failed" });
   }
 }

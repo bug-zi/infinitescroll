@@ -35,12 +35,16 @@ Optional:
 - `OPENAI_MODEL`
 - `OPENAI_RESPONSE_MODEL`
 - `OPENAI_IMAGE_MODEL`
+- `OPENAI_IMAGE_MODEL_FALLBACKS`
 - `OPENAI_IMAGE_API_MODEL`
+- `OPENAI_IMAGE_API_MODEL_FALLBACKS`
 - `OPENAI_API_KEYS`
 - `OPENAI_FALLBACK_API_KEY`
 - `DEEPSEEK_API_KEY`
 - `MAX_CONCURRENT_JOBS`
 - `GENERATION_TIMEOUT_MS`
+
+Image generation defaults to `gpt-image-2`, then falls back to `gpt-image-1.5,gpt-image-1` for both the Responses image tool and the Image API. `OPENAI_RESPONSE_MODEL` controls the GPT model that invokes the image tool.
 
 If `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` are missing, the deployed frontend cannot connect to Supabase and will display mock/template data.
 

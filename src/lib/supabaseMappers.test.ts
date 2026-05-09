@@ -1,5 +1,72 @@
 import { describe, expect, it } from "vitest";
-import { mapImageRow, mapJobRow, mapLogRow } from "./supabaseMappers";
+import { mapImageRow, mapJobRow, mapLogRow, mapScrollRow } from "./supabaseMappers";
+
+describe("mapScrollRow", () => {
+  it("maps archive timestamps for archived scrolls", () => {
+    const scroll = mapScrollRow({
+      id: "scroll-1",
+      title: "Archived",
+      status: "paused",
+      original_theme: "theme",
+      optimized_prompt: "prompt",
+      created_at: "2026-05-01T00:00:00.000Z",
+      last_generated_at: "2026-05-02T00:00:00.000Z",
+      next_run_at: "2026-05-03T00:00:00.000Z",
+      interval_minutes: 10,
+      overlap_preset: "standard",
+      overlap_ratio: 0.25,
+      image_count: 3,
+      auto_generation_enabled: false,
+      thumbnail_url: "/thumb.png",
+      archived_at: "2026-05-08T00:00:00.000Z",
+      purge_after: "2026-05-15T00:00:00.000Z",
+    });
+
+    expect(scroll.archivedAt).toBe("2026-05-08T00:00:00.000Z");
+    expect(scroll.purgeAfter).toBe("2026-05-15T00:00:00.000Z");
+  });
+
+  it("maps story generation metadata with free defaults", () => {
+    const storyScroll = mapScrollRow({
+      id: "scroll-2",
+      title: "西游记画卷",
+      status: "paused",
+      original_theme: "西游记连环画",
+      optimized_prompt: "",
+      created_at: "2026-05-01T00:00:00.000Z",
+      next_run_at: "2026-05-03T00:00:00.000Z",
+      interval_minutes: 5,
+      overlap_preset: "maximum",
+      overlap_ratio: 0.25,
+      image_count: 0,
+      auto_generation_enabled: false,
+      generation_mode: "story",
+      story_template: "journey_to_west",
+      story_template_version: "v1",
+      story_total_frames: 128,
+    });
+    const freeScroll = mapScrollRow({
+      id: "scroll-3",
+      title: "普通画卷",
+      status: "paused",
+      original_theme: "山海经",
+      optimized_prompt: "",
+      created_at: "2026-05-01T00:00:00.000Z",
+      next_run_at: "2026-05-03T00:00:00.000Z",
+      interval_minutes: 5,
+      overlap_preset: "maximum",
+      overlap_ratio: 0.25,
+      image_count: 0,
+      auto_generation_enabled: false,
+    });
+
+    expect(storyScroll.generationMode).toBe("story");
+    expect(storyScroll.storyTemplate).toBe("journey_to_west");
+    expect(storyScroll.storyTotalFrames).toBe(128);
+    expect(freeScroll.generationMode).toBe("free");
+    expect(freeScroll.storyTemplate).toBeNull();
+  });
+});
 
 describe("mapLogRow", () => {
   it("replaces question-mark mojibake logs with readable fallback text", () => {
@@ -52,17 +119,29 @@ describe("mapJobRow", () => {
       status: "queued",
       scheduled_for: "2026-05-07T12:04:04.000Z",
       creative_plan: {
+        mode: "story",
+        storyFrameIndex: 13,
+        storyTotalFrames: 128,
+        chapter: "大闹天宫",
         title: "第 13 张：桥头税关",
         continuityAnchor: "承接上一张右侧桥头栏杆。",
         newScene: "展开税关、货担与排队商旅。",
         composition: "桥头在左，税关在中，街巷向右延伸。",
         forbidden: "不得换成山水空景。",
+        characters: ["孙悟空"],
+        location: "南天门",
+        mood: "紧张",
         promptFragment: "严格按桥头税关计划生成。",
       },
     });
 
     expect(job.creativePlan).toMatchObject({
       title: "第 13 张：桥头税关",
+      mode: "story",
+      storyFrameIndex: 13,
+      storyTotalFrames: 128,
+      characters: ["孙悟空"],
+      location: "南天门",
       promptFragment: "严格按桥头税关计划生成。",
     });
   });

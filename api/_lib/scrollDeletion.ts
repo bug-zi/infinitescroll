@@ -9,3 +9,7 @@ export function getStoragePathFromPublicUrl(publicUrl: string | null | undefined
   const objectPath = pathWithQuery.split(/[?#]/, 1)[0];
   return objectPath ? decodeURIComponent(objectPath) : null;
 }
+
+export function calculatePurgeAfter(archivedAtIso: string) {
+  return new Date(Date.parse(archivedAtIso) + 7 * 24 * 60 * 60 * 1000).toISOString();
+}

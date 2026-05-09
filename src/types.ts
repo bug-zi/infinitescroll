@@ -8,13 +8,24 @@ export type JobType = "auto_next" | "regenerate" | "insert_before" | "insert_aft
 
 export type OverlapPreset = "standard" | "strong" | "maximum";
 
+export type GenerationMode = "free" | "story";
+
 export interface CreativePlan {
+  mode?: GenerationMode;
+  storyTemplate?: string | null;
+  storyTemplateVersion?: string | null;
+  storyFrameIndex?: number | null;
+  storyTotalFrames?: number | null;
+  chapter?: string;
   title: string;
   continuityAnchor: string;
   newScene: string;
   composition: string;
   forbidden: string;
   promptFragment: string;
+  characters?: string[];
+  location?: string;
+  mood?: string;
 }
 
 export interface CropRegion {
@@ -45,6 +56,8 @@ export interface ScrollImage {
   newContentCrop: CropRegion;
   hasStitchWarning?: boolean;
   stitchQualityScore?: number;
+  archivedAt?: string | null;
+  purgeAfter?: string | null;
 }
 
 export interface Scroll {
@@ -53,6 +66,12 @@ export interface Scroll {
   status: ScrollStatus;
   originalTheme: string;
   optimizedPrompt: string;
+  generationMode?: GenerationMode;
+  storyTemplate?: string | null;
+  storyTemplateVersion?: string | null;
+  storyTotalFrames?: number | null;
+  scriptSummary?: string | null;
+  characterBible?: string | null;
   createdAt: string;
   lastGeneratedAt: string;
   nextRunAt: string;
@@ -62,6 +81,8 @@ export interface Scroll {
   imageCount: number;
   autoGenerationEnabled: boolean;
   thumbnail: string;
+  archivedAt?: string | null;
+  purgeAfter?: string | null;
 }
 
 export interface GenerationJob {

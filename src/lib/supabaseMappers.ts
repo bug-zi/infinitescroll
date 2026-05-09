@@ -1,5 +1,6 @@
 import type { GenerationJob, GenerationLog, OverlapPreset, Scroll, ScrollImage } from "../types";
 import { normalizeCreativePlan } from "./creativePlan";
+import { detectStoryMode } from "./storyMode";
 import { normalizeImageRatioLabel } from "./stitching";
 
 type JsonCrop = {
@@ -26,12 +27,20 @@ function numericMeta(value: unknown, key: string) {
 }
 
 export function mapScrollRow(row: Record<string, any>): Scroll {
+  const detected = detectStoryMode(row.original_theme, row.optimized_prompt);
+  const generationMode = row.generation_mode === "story" || row.generation_mode === "free" ? row.generation_mode : detected.generationMode;
   return {
     id: row.id,
     title: row.title,
     status: row.status,
     originalTheme: row.original_theme,
     optimizedPrompt: row.optimized_prompt,
+    generationMode,
+    storyTemplate: row.story_template ?? (generationMode === "story" ? detected.storyTemplate : null),
+    storyTemplateVersion: row.story_template_version ?? (generationMode === "story" ? detected.storyTemplateVersion : null),
+    storyTotalFrames: row.story_total_frames ?? (generationMode === "story" ? detected.storyTotalFrames : null),
+    scriptSummary: row.script_summary ?? null,
+    characterBible: row.character_bible ?? null,
     createdAt: row.created_at,
     lastGeneratedAt: row.last_generated_at ?? row.created_at,
     nextRunAt: row.next_run_at,
@@ -41,6 +50,8 @@ export function mapScrollRow(row: Record<string, any>): Scroll {
     imageCount: row.image_count,
     autoGenerationEnabled: row.auto_generation_enabled,
     thumbnail: row.thumbnail_url ?? "/assets/scroll-segment.svg",
+    archivedAt: row.archived_at ?? null,
+    purgeAfter: row.purge_after ?? null,
   };
 }
 
@@ -66,6 +77,8 @@ export function mapImageRow(row: Record<string, any>): ScrollImage {
     newContentCrop: crop(row.new_content_crop),
     hasStitchWarning: row.has_stitch_warning,
     stitchQualityScore: numericMeta(row.overlap_crop, "stitchQualityScore"),
+    archivedAt: row.archived_at ?? null,
+    purgeAfter: row.purge_after ?? null,
   };
 }
 

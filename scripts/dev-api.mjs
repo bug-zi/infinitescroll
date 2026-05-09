@@ -1,4 +1,4 @@
-import { createServer } from "node:http";
+﻿import { createServer } from "node:http";
 import { Buffer } from "node:buffer";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
@@ -7,6 +7,16 @@ import OpenAI from "openai";
 import sharp from "sharp";
 import { persistGeneratedImageToSupabase } from "./dev-storage.mjs";
 import { createTimeoutFetch } from "./supabase-fetch.mjs";
+import {
+  AI_SCRIPT_TEMPLATE,
+  AI_SCRIPT_TEMPLATE_VERSION,
+  buildAiScriptCreativePlan,
+  buildCreativePlanPromptSection,
+  createCreativePlan,
+  detectStoryMode,
+  mapScriptFrameRow,
+  normalizeCreativePlan,
+} from "./creative-plan-runtime.mjs";
 
 loadEnv(".env.local");
 
@@ -28,8 +38,41 @@ const schedulerState = {
   lastError: null,
 };
 const generationTimeoutMs = Number(process.env.GENERATION_TIMEOUT_MS ?? 12 * 60 * 1000);
+const staleRunningJobMinutes = Number(process.env.STALE_RUNNING_JOB_MINUTES ?? Math.ceil(generationTimeoutMs / 60000) + 3);
 const SCROLL_IMAGE_HEIGHT = 1152;
 const SCROLL_VISIBLE_WIDTH = 1536;
+const DEFAULT_RESPONSE_MODEL = "gpt-5.5";
+const DEFAULT_IMAGE_TOOL_MODEL = "gpt-image-2";
+const DEFAULT_IMAGE_TOOL_FALLBACKS = "gpt-image-1.5,gpt-image-1";
+const DEFAULT_IMAGE_API_MODEL = "gpt-image-2";
+const DEFAULT_IMAGE_API_FALLBACKS = "gpt-image-1.5,gpt-image-1";
+
+function calculatePurgeAfter(archivedAtIso) {
+  return new Date(Date.parse(archivedAtIso) + 7 * 24 * 60 * 60 * 1000).toISOString();
+}
+
+function isMissingArchiveColumnError(error) {
+  if (!error || typeof error !== "object") return false;
+  const code = String(error.code ?? "");
+  const message = String(error.message ?? "").toLowerCase();
+  return code === "42703" && (message.includes("archived_at") || message.includes("purge_after"));
+}
+
+async function runOptionalArchiveMaintenance(taskName, task) {
+  try {
+    await task();
+  } catch (error) {
+    if (!isMissingArchiveColumnError(error)) throw error;
+    log(`${taskName} skipped because archive columns are not installed yet`);
+  }
+}
+
+async function queryMaybeActiveRows(activeQuery, fallbackQuery) {
+  const result = await activeQuery;
+  if (!result.error || !isMissingArchiveColumnError(result.error)) return result;
+  log("archive column filter skipped because archive columns are not installed yet");
+  return await fallbackQuery;
+}
 
 export async function handleDevApiRequest(req, res) {
   try {
@@ -65,8 +108,17 @@ export async function handleDevApiRequest(req, res) {
 
     if (req.method === "POST" && url.pathname === "/api/scrolls/create") {
       const body = await readJson(req);
-      const scroll = await createScroll(String(body.theme ?? ""));
+      const scroll = await createScroll(body);
       json(res, 200, { ok: true, scroll });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/prompts/optimize") {
+      const body = await readJson(req);
+      const theme = String(body.theme ?? "").trim();
+      if (!theme) throw new Error("theme is required");
+      const optimizedPrompt = await optimizeTheme(theme);
+      json(res, 200, { ok: true, optimizedPrompt });
       return;
     }
 
@@ -84,6 +136,34 @@ export async function handleDevApiRequest(req, res) {
       return;
     }
 
+    if (req.method === "POST" && url.pathname === "/api/scrolls/restore") {
+      const body = await readJson(req);
+      const result = await restoreScroll(String(body.scrollId ?? ""));
+      json(res, 200, { ok: true, ...result });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/scrolls/purge") {
+      const body = await readJson(req);
+      const result = await purgeScroll(String(body.scrollId ?? ""));
+      json(res, 200, { ok: true, ...result });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/scripts/draft") {
+      const body = await readJson(req);
+      const draft = await draftScript(body);
+      json(res, 200, { ok: true, draft });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/images/purge") {
+      const body = await readJson(req);
+      const result = await purgeImage(String(body.imageId ?? ""));
+      json(res, 200, { ok: true, ...result });
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/api/jobs/retry") {
       const body = await readJson(req);
       const result = await retryFailedJob(String(body.jobId ?? ""));
@@ -94,6 +174,13 @@ export async function handleDevApiRequest(req, res) {
     if (req.method === "POST" && url.pathname === "/api/images/delete") {
       const body = await readJson(req);
       const result = await deleteImage(String(body.imageId ?? ""));
+      json(res, 200, { ok: true, result });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/images/restore") {
+      const body = await readJson(req);
+      const result = await restoreImage(String(body.imageId ?? ""));
       json(res, 200, { ok: true, result });
       return;
     }
@@ -165,6 +252,8 @@ async function runSchedulerTick(source) {
   schedulerState.lastTickAt = new Date().toISOString();
   schedulerState.lastError = null;
   try {
+    await runOptionalArchiveMaintenance("purge expired archived scrolls", purgeExpiredArchivedScrolls);
+    await runOptionalArchiveMaintenance("purge expired archived images", purgeExpiredArchivedImages);
     const result = await generateDueImages();
     schedulerState.lastResult = { source, generated: result.length, result };
     if (result.length) log(`scheduler ${source} generated ${result.length} result(s)`);
@@ -187,12 +276,29 @@ async function releaseStaleRunningJobsForStatus() {
   }
 }
 
-async function createScroll(theme) {
-  const cleanTheme = theme.trim();
+async function purgeExpiredArchivedScrolls() {
+  const { data, error } = await supabase.from("scrolls").select("id").not("archived_at", "is", null).lte("purge_after", new Date().toISOString());
+  if (error) throw error;
+  for (const scroll of data ?? []) {
+    await purgeScroll(scroll.id);
+  }
+}
+
+async function createScroll(input) {
+  const cleanTheme = String(input?.theme ?? "").trim();
   if (!cleanTheme) throw new Error("theme is required");
 
-  const optimizedPrompt = await optimizeTheme(cleanTheme);
-  const nextRunAt = new Date(Date.now() + 300000).toISOString();
+  const optimizedPrompt = String(input?.optimizedPrompt ?? "").trim();
+  const scriptFramesInput = Array.isArray(input?.storyFrames) ? input.storyFrames : [];
+  const wantsAiScript = input?.generationMode === "story" && input?.storyTemplate === AI_SCRIPT_TEMPLATE;
+  const storyMode = wantsAiScript
+    ? {
+        generationMode: "story",
+        storyTemplate: AI_SCRIPT_TEMPLATE,
+        storyTemplateVersion: AI_SCRIPT_TEMPLATE_VERSION,
+        storyTotalFrames: scriptFramesInput.length,
+      }
+    : detectStoryMode(cleanTheme, optimizedPrompt);
   const now = new Date().toISOString();
   const { data, error } = await supabase
     .from("scrolls")
@@ -200,14 +306,20 @@ async function createScroll(theme) {
       title: `${cleanTheme.slice(0, 12)}画卷`,
       original_theme: cleanTheme,
       optimized_prompt: optimizedPrompt,
-      status: "generating",
-      auto_generation_enabled: true,
+      generation_mode: storyMode.generationMode,
+      story_template: storyMode.storyTemplate,
+      story_template_version: storyMode.storyTemplateVersion,
+      story_total_frames: storyMode.storyTotalFrames,
+      script_summary: typeof input?.scriptSummary === "string" ? input.scriptSummary.trim() : null,
+      character_bible: typeof input?.characterBible === "string" ? input.characterBible.trim() : null,
+      status: "paused",
+      auto_generation_enabled: false,
       interval_minutes: 5,
       overlap_preset: FIXED_OVERLAP_PRESET,
       overlap_ratio: FIXED_OVERLAP_RATIO,
       image_count: 0,
-      next_run_at: nextRunAt,
-      last_generated_at: now,
+      next_run_at: new Date(Date.now() + 300000).toISOString(),
+      last_generated_at: null,
       thumbnail_url: "/assets/scroll-segment.svg",
     })
     .select()
@@ -215,21 +327,30 @@ async function createScroll(theme) {
 
   if (error) throw error;
 
-  await insertInitialJob({
-    scrollId: data.id,
-    scheduledFor: nextRunAt,
-    creativePlan: createCreativePlan({
-      theme: cleanTheme,
-      optimizedPrompt,
-      targetIndex: 1,
-      hasReferenceImage: false,
-    }),
-  });
+  if (wantsAiScript && scriptFramesInput.length) {
+    const { error: frameError } = await supabase.from("scroll_story_frames").insert(
+      scriptFramesInput.map((frame, index) => ({
+        scroll_id: data.id,
+        frame_index: Number(frame.frameIndex ?? index + 1),
+        chapter: String(frame.chapter ?? ""),
+        title: String(frame.title ?? `第 ${index + 1} 帧`),
+        scene: String(frame.scene ?? ""),
+        characters: Array.isArray(frame.characters) ? frame.characters : [],
+        location: String(frame.location ?? ""),
+        mood: String(frame.mood ?? ""),
+        continuity_anchor: String(frame.continuityAnchor ?? ""),
+        forbidden: String(frame.forbidden ?? ""),
+        visual_prompt_hint: String(frame.visualPromptHint ?? ""),
+      })),
+    );
+    if (frameError) throw frameError;
+  }
+
   await supabase.from("generation_logs").insert({
     scroll_id: data.id,
     level: "success",
-    message: "画卷已创建",
-    detail: "第一张图片任务已进入队列",
+    message: "空白画卷已创建",
+    detail: "尚未生成图片。点击立即生成或开启自动生成后开始绘制。",
   });
 
   return data;
@@ -254,7 +375,34 @@ async function updateScroll(body) {
 
 async function deleteScroll(scrollId) {
   if (!isUuid(scrollId)) throw new Error("Invalid scrollId");
+  const archivedAt = new Date().toISOString();
+  const purgeAfter = calculatePurgeAfter(archivedAt);
+  const { error } = await supabase
+    .from("scrolls")
+    .update({
+      archived_at: archivedAt,
+      purge_after: purgeAfter,
+      auto_generation_enabled: false,
+      status: "paused",
+      updated_at: archivedAt,
+    })
+    .eq("id", scrollId);
+  if (error) throw error;
+  return { scrollId, archivedAt, purgeAfter };
+}
 
+async function restoreScroll(scrollId) {
+  if (!isUuid(scrollId)) throw new Error("Invalid scrollId");
+  const { error } = await supabase
+    .from("scrolls")
+    .update({ archived_at: null, purge_after: null, auto_generation_enabled: true, status: "generating", updated_at: new Date().toISOString() })
+    .eq("id", scrollId);
+  if (error) throw error;
+  return { scrollId };
+}
+
+async function purgeScroll(scrollId) {
+  if (!isUuid(scrollId)) throw new Error("Invalid scrollId");
   const { data: images, error: imageLoadError } = await supabase.from("scroll_images").select("full_image_url").eq("scroll_id", scrollId);
   if (imageLoadError) throw imageLoadError;
 
@@ -273,10 +421,8 @@ async function deleteScroll(scrollId) {
 
   const { error: scrollError } = await supabase.from("scrolls").delete().eq("id", scrollId);
   if (scrollError) throw scrollError;
-
   return { scrollId, deletedImages: images?.length ?? 0 };
 }
-
 function buildScrollUpdatePatch(body) {
   const patch = { updated_at: new Date().toISOString() };
   if (typeof body.title === "string" && body.title.trim()) patch.title = body.title.trim();
@@ -448,12 +594,16 @@ function getNextRunLabel(nextRunAt, nowMs = Date.now()) {
 
 async function generateDueImages(scrollId, options = {}) {
   const filters = getCandidateScrollFilters({ scrollId, manual: Boolean(options.manual) });
-  let query = supabase.from("scrolls").select("*").limit(Number(process.env.MAX_CONCURRENT_JOBS ?? 2));
-  if (filters.requireAutoEnabled) query = query.eq("auto_generation_enabled", true);
-  if (filters.scrollId) query = query.eq("id", filters.scrollId);
-  if (filters.dueBeforeIso) query = query.lte("next_run_at", filters.dueBeforeIso);
+  const buildQuery = (includeArchiveFilter) => {
+    let query = supabase.from("scrolls").select("*").limit(Number(process.env.MAX_CONCURRENT_JOBS ?? 2));
+    if (includeArchiveFilter) query = query.is("archived_at", null);
+    if (filters.requireAutoEnabled) query = query.eq("auto_generation_enabled", true);
+    if (filters.scrollId) query = query.eq("id", filters.scrollId);
+    if (filters.dueBeforeIso) query = query.lte("next_run_at", filters.dueBeforeIso);
+    return query;
+  };
 
-  const { data: scrolls, error } = await query;
+  const { data: scrolls, error } = await queryMaybeActiveRows(buildQuery(true), buildQuery(false));
   if (error) throw error;
 
   const settled = await Promise.allSettled((scrolls ?? []).map((scroll) => generateOneScrollImage(scroll)));
@@ -465,6 +615,11 @@ async function generateDueImages(scrollId, options = {}) {
 
 async function generateOneScrollImage(scroll) {
   const targetIndex = Number(scroll.image_count ?? 0) + 1;
+  const aiScriptFrame = await loadAiScriptFrameIfNeeded(scroll, targetIndex);
+  if (aiScriptFrame?.complete) {
+    await markScrollComplete(scroll.id);
+    return { scrollId: scroll.id, targetIndex, skipped: "story_complete" };
+  }
   const runningJob = await loadRunningJob(scroll.id);
   if (runningJob) {
     if (isStaleRunningJob({ lockedAt: runningJob.locked_at })) {
@@ -483,13 +638,23 @@ async function generateOneScrollImage(scroll) {
     const previousVisibleBuffer = previousImage ? await readLocalPublicImage(previousImage.full_image_url) : null;
     const referenceImageBase64 =
       previousVisibleBuffer && overlapWidth > 0 ? (await extractRightOverlapByWidth(previousVisibleBuffer, overlapWidth, height)).toString("base64") : undefined;
-    const creativePlan = normalizeCreativePlan(job.hasPersistedCreativePlan ? job.creative_plan : undefined, {
-      theme: scroll.original_theme,
-      optimizedPrompt: scroll.optimized_prompt,
-      previousPrompt: previousImage?.prompt,
-      targetIndex,
-      hasReferenceImage: Boolean(previousVisibleBuffer),
-    });
+    const creativePlan = aiScriptFrame?.frame
+      ? buildAiScriptCreativePlan({
+          frame: aiScriptFrame.frame,
+          totalFrames: Number(scroll.story_total_frames ?? aiScriptFrame.totalFrames),
+          previousSummary: targetIndex > 1 ? summarizePreviousPrompt(previousImage?.prompt, 240) : "",
+        })
+      : normalizeCreativePlan(job.hasPersistedCreativePlan ? job.creative_plan : undefined, {
+          theme: scroll.original_theme,
+          optimizedPrompt: scroll.optimized_prompt,
+          generationMode: scroll.generation_mode,
+          storyTemplate: scroll.story_template,
+          storyTemplateVersion: scroll.story_template_version,
+          storyTotalFrames: scroll.story_total_frames,
+          previousPrompt: scroll.generation_mode === "story" ? undefined : summarizePreviousPrompt(previousImage?.prompt),
+          targetIndex,
+          hasReferenceImage: Boolean(previousVisibleBuffer),
+        });
     if (JSON.stringify(creativePlan) !== JSON.stringify(job.creative_plan)) {
       await updateJobCreativePlan(job.id, creativePlan, now);
     }
@@ -551,18 +716,33 @@ async function generateOneScrollImage(scroll) {
       })
       .eq("id", scroll.id);
 
-    await insertQueuedJob({
-      scrollId: scroll.id,
-      targetIndex: targetIndex + 1,
-      scheduledFor: nextRunAt,
-      creativePlan: createCreativePlan({
-        theme: scroll.original_theme,
-        optimizedPrompt: scroll.optimized_prompt,
-        previousPrompt: generated.prompt,
+    const nextFrame = await loadAiScriptFrameIfNeeded(scroll, targetIndex + 1);
+    if (nextFrame?.complete) {
+      await markScrollComplete(scroll.id);
+    } else {
+      await insertQueuedJob({
+        scrollId: scroll.id,
         targetIndex: targetIndex + 1,
-        hasReferenceImage: true,
-      }),
-    });
+        scheduledFor: nextRunAt,
+        creativePlan: nextFrame?.frame
+          ? buildAiScriptCreativePlan({
+              frame: nextFrame.frame,
+              totalFrames: Number(scroll.story_total_frames ?? nextFrame.totalFrames),
+              previousSummary: summarizePreviousPlanForNextPrompt(creativePlan, generated.prompt),
+            })
+          : createCreativePlan({
+              theme: scroll.original_theme,
+              optimizedPrompt: scroll.optimized_prompt,
+              generationMode: scroll.generation_mode,
+              storyTemplate: scroll.story_template,
+              storyTemplateVersion: scroll.story_template_version,
+              storyTotalFrames: scroll.story_total_frames,
+              previousPrompt: summarizePreviousPlanForNextPrompt(creativePlan, generated.prompt),
+              targetIndex: targetIndex + 1,
+              hasReferenceImage: true,
+            }),
+      });
+    }
 
     await supabase.from("generation_logs").insert({
       scroll_id: scroll.id,
@@ -668,6 +848,29 @@ async function loadRunningJob(scrollId) {
   return data;
 }
 
+async function loadAiScriptFrameIfNeeded(scroll, targetIndex) {
+  if (scroll.generation_mode !== "story" || scroll.story_template !== AI_SCRIPT_TEMPLATE) return null;
+  const totalFrames = Number(scroll.story_total_frames ?? 0);
+  if (totalFrames > 0 && targetIndex > totalFrames) return { complete: true, totalFrames };
+  const { data, error } = await supabase
+    .from("scroll_story_frames")
+    .select("*")
+    .eq("scroll_id", scroll.id)
+    .eq("frame_index", targetIndex)
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) return { complete: true, totalFrames };
+  return { complete: false, totalFrames, frame: mapScriptFrameRow(data) };
+}
+
+async function markScrollComplete(scrollId) {
+  const { error } = await supabase
+    .from("scrolls")
+    .update({ status: "complete", auto_generation_enabled: false, updated_at: new Date().toISOString() })
+    .eq("id", scrollId);
+  if (error) throw error;
+}
+
 function getCandidateScrollFilters({ scrollId, manual = false, nowIso = new Date().toISOString() }) {
   return {
     scrollId: scrollId ?? undefined,
@@ -690,7 +893,7 @@ function parsePositiveInteger(value) {
   return Math.floor(parsed);
 }
 
-function isStaleRunningJob({ lockedAt, nowIso = new Date().toISOString(), staleAfterMinutes = Number(process.env.STALE_RUNNING_JOB_MINUTES ?? 6) }) {
+function isStaleRunningJob({ lockedAt, nowIso = new Date().toISOString(), staleAfterMinutes = staleRunningJobMinutes }) {
   if (!lockedAt) return false;
   const lockedTime = Date.parse(lockedAt);
   const nowTime = Date.parse(nowIso);
@@ -727,6 +930,10 @@ async function createRunningJob(scroll, targetIndex, type) {
   const initialPlan = normalizeCreativePlan(queuedJob?.creative_plan, {
     theme: scroll.original_theme,
     optimizedPrompt: scroll.optimized_prompt,
+    generationMode: scroll.generation_mode,
+    storyTemplate: scroll.story_template,
+    storyTemplateVersion: scroll.story_template_version,
+    storyTotalFrames: scroll.story_total_frames,
     targetIndex,
     hasReferenceImage: targetIndex > 1,
   });
@@ -859,47 +1066,54 @@ async function insertQueuedJob(input) {
 
 async function deleteImage(imageId) {
   if (!isUuid(imageId)) throw new Error("Invalid imageId");
-  const { data: image, error: imageError } = await supabase.from("scroll_images").select("*").eq("id", imageId).single();
+  const { data: image, error: imageError } = await supabase.from("scroll_images").select("scroll_id,image_index").eq("id", imageId).single();
   if (imageError) throw imageError;
-  const { data: scroll, error: scrollError } = await supabase.from("scrolls").select("*").eq("id", image.scroll_id).single();
-  if (scrollError) throw scrollError;
-
-  const isTail = Number(image.image_index) === Number(scroll.image_count);
-  const nextCount = Math.max(0, Number(scroll.image_count ?? 0) - 1);
-
-  const { error: deleteError } = await supabase.from("scroll_images").delete().eq("id", imageId);
-  if (deleteError) throw deleteError;
-
-  if (!isTail) {
-    const { error: reviewError } = await supabase
-      .from("scroll_images")
-      .update({ status: "needs_review", has_stitch_warning: true })
-      .eq("scroll_id", image.scroll_id)
-      .gt("image_index", image.image_index);
-    if (reviewError) throw reviewError;
-  }
-
-  const latestImage = await loadLatestImage(image.scroll_id);
-  const { error: updateError } = await supabase
-    .from("scrolls")
-    .update({
-      image_count: nextCount,
-      status: isTail ? scroll.status : "paused",
-      auto_generation_enabled: isTail ? scroll.auto_generation_enabled : false,
-      thumbnail_url: latestImage?.full_image_url ?? "/assets/scroll-segment.svg",
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", image.scroll_id);
-  if (updateError) throw updateError;
+  const archivedAt = new Date().toISOString();
+  const purgeAfter = calculatePurgeAfter(archivedAt);
+  const { error: archiveError } = await supabase.from("scroll_images").update({ archived_at: archivedAt, purge_after: purgeAfter }).eq("id", imageId);
+  if (archiveError) throw archiveError;
 
   await supabase.from("generation_logs").insert({
     scroll_id: image.scroll_id,
     level: "warning",
-    message: `第 ${image.image_index} 张已删除`,
-    detail: isTail ? "末尾图片已删除" : "中间图片删除后已暂停自动生成并标记后续衔接风险",
+    message: `第 ${image.image_index} 张已移入归档站`,
+    detail: "7 天内可从归档站恢复到原位置。",
   });
 
-  return { imageId, scrollId: image.scroll_id, deletedIndex: image.image_index, paused: !isTail };
+  return { imageId, scrollId: image.scroll_id, imageIndex: image.image_index, archivedAt, purgeAfter };
+}
+
+async function restoreImage(imageId) {
+  if (!isUuid(imageId)) throw new Error("Invalid imageId");
+  const { data: image, error: imageError } = await supabase.from("scroll_images").select("scroll_id,image_index").eq("id", imageId).single();
+  if (imageError) throw imageError;
+  const { error } = await supabase.from("scroll_images").update({ archived_at: null, purge_after: null }).eq("id", imageId);
+  if (error) throw error;
+
+  await supabase.from("generation_logs").insert({
+    scroll_id: image.scroll_id,
+    level: "success",
+    message: `第 ${image.image_index} 张已恢复`,
+    detail: "图片已回到画卷原位置。",
+  });
+
+  return { imageId, scrollId: image.scroll_id, imageIndex: image.image_index };
+}
+
+async function purgeImage(imageId) {
+  if (!isUuid(imageId)) throw new Error("Invalid imageId");
+  const { data: image, error: imageLoadError } = await supabase.from("scroll_images").select("full_image_url").eq("id", imageId).single();
+  if (imageLoadError) throw imageLoadError;
+
+  const storagePath = getStoragePathFromPublicUrl(image?.full_image_url, "scroll-images");
+  if (storagePath) {
+    const { error: storageError } = await supabase.storage.from("scroll-images").remove([storagePath]);
+    if (storageError) throw storageError;
+  }
+
+  const { error: deleteError } = await supabase.from("scroll_images").delete().eq("id", imageId);
+  if (deleteError) throw deleteError;
+  return { imageId, deletedImages: 1 };
 }
 
 async function regenerateImage(imageId) {
@@ -947,48 +1161,161 @@ async function markFollowingForReview(image) {
 }
 
 async function loadLatestImage(scrollId) {
-  const { data, error } = await supabase
-    .from("scroll_images")
-    .select("full_image_url")
-    .eq("scroll_id", scrollId)
-    .order("image_index", { ascending: false })
-    .limit(1)
-    .maybeSingle();
+  const buildQuery = (includeArchiveFilter) => {
+    let query = supabase.from("scroll_images").select("full_image_url").eq("scroll_id", scrollId);
+    if (includeArchiveFilter) query = query.is("archived_at", null);
+    return query.order("image_index", { ascending: false }).limit(1).maybeSingle();
+  };
+
+  const { data, error } = await queryMaybeActiveRows(buildQuery(true), buildQuery(false));
   if (error) throw error;
   return data;
 }
 
 async function optimizeTheme(theme) {
   if (!process.env.DEEPSEEK_API_KEY) return fallbackPrompt(theme);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Number(process.env.DEEPSEEK_TIMEOUT_MS ?? 20000));
 
-  const response = await fetch("https://api.deepseek.com/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "deepseek-chat",
-      messages: [
-        { role: "system", content: "你是画卷提示词工程师。只输出适合连续横向长卷生成的中文提示词正文。" },
-        { role: "user", content: theme },
-      ],
-      temperature: 0.7,
-    }),
+  try {
+    const response = await fetch("https://api.deepseek.com/chat/completions", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "deepseek-chat",
+        messages: [
+          {
+            role: "system",
+            content:
+              "你是《无限画卷》的画卷提示词工程师。必须严格围绕用户主题优化提示词，不得替换成无关题材，不得泛化成普通山水或古风模板。输出必须是中文提示词正文，不要标题、解释、编号或 Markdown。提示词要适合横向连续长卷：说明核心题材、时代或世界观、视觉风格、色彩与光照、左到右叙事推进、相邻画面衔接、可持续生成的空间线索。",
+          },
+          {
+            role: "user",
+            content: `用户主题：${theme}\n\n请把这个主题优化成一段可直接交给图像模型生成连续横向画卷的提示词。必须保留并强化主题中的关键名词和气质。`,
+          },
+        ],
+        temperature: 0.35,
+      }),
+    });
+
+    if (!response.ok) return fallbackPrompt(theme);
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content?.trim() || fallbackPrompt(theme);
+  } catch {
+    return fallbackPrompt(theme);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function draftScript(input) {
+  const theme = String(input?.theme ?? "").trim();
+  if (!theme) throw new Error("theme is required");
+  const frameCount = normalizeScriptFrameCount(input?.frameCount);
+  if (!process.env.DEEPSEEK_API_KEY) throw new Error("DEEPSEEK_API_KEY is required for script drafting");
+  const content = await requestDeepSeekScript({
+    theme,
+    frameCount,
+    requirements: String(input?.requirements ?? "").trim(),
+    stylePrompt: String(input?.stylePrompt ?? "").trim(),
   });
+  return normalizeScriptDraftPayload(JSON.parse(content), frameCount, theme);
+}
 
-  if (!response.ok) return fallbackPrompt(theme);
-  const data = await response.json();
-  return data.choices?.[0]?.message?.content?.trim() || fallbackPrompt(theme);
+function normalizeScriptFrameCount(value) {
+  const count = Number(value);
+  return [24, 48, 96, 128].includes(count) ? count : 48;
+}
+
+async function requestDeepSeekScript({ theme, frameCount, requirements, stylePrompt }) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Number(process.env.DEEPSEEK_TIMEOUT_MS ?? 60000));
+  try {
+    const response = await fetch("https://api.deepseek.com/chat/completions", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "deepseek-chat",
+        temperature: 0.45,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content: "你是《无限画卷》的专业编剧和分镜导演。必须输出严格 JSON，不要 Markdown。剧情必须逐帧推进，角色和视觉风格保持一致。",
+          },
+          {
+            role: "user",
+            content: [
+              `主题：${theme}`,
+              `总帧数：${frameCount}`,
+              requirements ? `补充要求：${requirements}` : "",
+              stylePrompt ? `视觉风格提示：${stylePrompt}` : "",
+              "请输出 JSON 对象，字段必须包含：title, summary, visualStyle, characterBible, frames。",
+              "frames 长度必须等于总帧数，每帧包含 frameIndex, chapter, title, scene, characters, location, mood, continuityAnchor, forbidden, visualPromptHint。",
+            ]
+              .filter(Boolean)
+              .join("\n"),
+          },
+        ],
+      }),
+    });
+    if (!response.ok) throw new Error(`DeepSeek script draft failed: ${response.status} ${await response.text()}`);
+    const data = await response.json();
+    const raw = data.choices?.[0]?.message?.content?.trim();
+    if (!raw) throw new Error("DeepSeek returned empty script draft");
+    return raw;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function normalizeScriptDraftPayload(value, frameCount, theme) {
+  const frames = Array.isArray(value?.frames) ? value.frames : [];
+  if (frames.length !== frameCount) throw new Error(`Expected ${frameCount} script frames, got ${frames.length}`);
+  return {
+    title: String(value.title ?? `${theme}画卷剧本`).trim(),
+    summary: String(value.summary ?? "").trim(),
+    visualStyle: String(value.visualStyle ?? "").trim(),
+    characterBible: String(value.characterBible ?? "").trim(),
+    frames: frames.map((frame, index) => ({
+      frameIndex: Number(frame.frameIndex ?? index + 1),
+      chapter: String(frame.chapter ?? "未分章").trim(),
+      title: String(frame.title ?? `第 ${index + 1} 帧`).trim(),
+      scene: String(frame.scene ?? "").trim(),
+      characters: Array.isArray(frame.characters) ? frame.characters.map((item) => String(item).trim()).filter(Boolean) : [],
+      location: String(frame.location ?? "").trim(),
+      mood: String(frame.mood ?? "").trim(),
+      continuityAnchor: String(frame.continuityAnchor ?? "采用分镜长卷衔接：用道路、云气、光色、卷轴纹理和运动方向承接上一帧。").trim(),
+      forbidden: String(frame.forbidden ?? "只画当前剧情帧，不得提前画后续剧情，不得跳过剧情，不得改编成无关场景。").trim(),
+      visualPromptHint: String(frame.visualPromptHint ?? "").trim(),
+    })),
+  };
+}
+
+async function purgeExpiredArchivedImages() {
+  const { data, error } = await supabase.from("scroll_images").select("id").not("archived_at", "is", null).lte("purge_after", new Date().toISOString());
+  if (error) throw error;
+  for (const image of data ?? []) {
+    await purgeImage(image.id);
+  }
 }
 
 async function loadPreviousImage(scrollId, imageIndex) {
-  const { data, error } = await supabase
-    .from("scroll_images")
-    .select("*")
-    .eq("scroll_id", scrollId)
-    .eq("image_index", imageIndex)
-    .single();
+  const buildQuery = (includeArchiveFilter) => {
+    let query = supabase.from("scroll_images").select("*").eq("scroll_id", scrollId).eq("image_index", imageIndex);
+    if (includeArchiveFilter) query = query.is("archived_at", null);
+    return query.single();
+  };
+
+  const { data, error } = await queryMaybeActiveRows(buildQuery(true), buildQuery(false));
   if (error) throw error;
   return data;
 }
@@ -1004,7 +1331,7 @@ async function generateImage(prompt, referenceImageBase64) {
     const textOnlyResponsesResult = await tryResponsesImageTool(prompt, undefined);
     if (textOnlyResponsesResult) return textOnlyResponsesResult;
   }
-  return tryImageApi(v1, process.env.OPENAI_IMAGE_API_MODEL ?? "gpt-image-1", prompt);
+  return tryImageApi(v1, prompt);
 }
 
 async function generateOutpaintedImage(prompt, previousImageBuffer, overlapRatio, sourceOverlapWidth, sourceHeight, sourceWidth, referenceImageBase64) {
@@ -1013,7 +1340,7 @@ async function generateOutpaintedImage(prompt, previousImageBuffer, overlapRatio
   if (editResult) return editResult;
   void referenceImageBase64;
   log("outpaint edit failed; refusing plain generation because strict scroll stitching requires edit-based continuation");
-  return { prompt, model: `${process.env.OPENAI_IMAGE_API_MODEL ?? "gpt-image-1"} edit-outpaint failed`, fallback: true };
+  return { prompt, model: `${getImageApiModelCandidates()[0]} edit-outpaint failed`, fallback: true };
 }
 
 async function generateDeterministicImage(prompt, seed) {
@@ -1037,13 +1364,13 @@ async function tryImageEditOutpaint(prompt, previousImageBuffer, overlapRatio, s
   const baseUrl = (process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/$/, "");
   const v1 = baseUrl.endsWith("/v1") ? baseUrl : `${baseUrl}/v1`;
   const endpoint = `${v1}/images/edits`;
-  const model = process.env.OPENAI_IMAGE_API_MODEL ?? "gpt-image-1";
   const editWidth = sourceWidth ?? 1536;
   const editHeight = sourceWidth ? sourceHeight : 1024;
   const overlapWidth = sourceOverlapWidth ?? Math.max(1, Math.round((editWidth / (1 + overlapRatio)) * overlapRatio));
   const canvas = await createOutpaintCanvas(previousImageBuffer, editWidth, editHeight, overlapWidth, sourceOverlapWidth ?? overlapWidth, sourceHeight);
   const mask = await createOutpaintMask(editWidth, editHeight, overlapWidth);
-  for (const apiKey of getOpenAIKeyPool()) {
+  for (const model of getImageApiModelCandidates()) {
+    for (const apiKey of getOpenAIKeyPool()) {
     const keyLabel = getOpenAIKeyLabel(apiKey);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), getImageRequestTimeoutMs());
@@ -1052,7 +1379,7 @@ async function tryImageEditOutpaint(prompt, previousImageBuffer, overlapRatio, s
     form.append("prompt", prompt);
     form.append("size", sourceWidth ? "auto" : "1536x1024");
     form.append("quality", "high");
-    form.append("input_fidelity", "high");
+    if (model !== "gpt-image-2") form.append("input_fidelity", "high");
     form.append("n", "1");
     form.append("image[]", new Blob([new Uint8Array(canvas)], { type: "image/png" }), "canvas.png");
     form.append("image[]", new Blob([new Uint8Array(previousImageBuffer)], { type: "image/png" }), "previous.png");
@@ -1083,13 +1410,13 @@ async function tryImageEditOutpaint(prompt, previousImageBuffer, overlapRatio, s
     } finally {
       clearTimeout(timeout);
     }
+    }
   }
   return null;
 }
 
 async function tryResponsesImageTool(prompt, referenceImageBase64) {
-  const responseModel = process.env.OPENAI_RESPONSE_MODEL || process.env.OPENAI_MODEL || "gpt-5.5";
-  const imageModel = process.env.OPENAI_IMAGE_MODEL || "gpt-image-1.5";
+  const responseModel = getEnvValue("OPENAI_RESPONSE_MODEL") || getEnvValue("OPENAI_MODEL") || DEFAULT_RESPONSE_MODEL;
   const content = [{ type: "input_text", text: prompt }];
   if (referenceImageBase64) {
     content.push({
@@ -1099,7 +1426,8 @@ async function tryResponsesImageTool(prompt, referenceImageBase64) {
     });
   }
 
-  for (const apiKey of getOpenAIKeyPool()) {
+  for (const imageModel of getImageToolModelCandidates()) {
+    for (const apiKey of getOpenAIKeyPool()) {
     const keyLabel = getOpenAIKeyLabel(apiKey);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), getImageRequestTimeoutMs());
@@ -1121,6 +1449,7 @@ async function tryResponsesImageTool(prompt, referenceImageBase64) {
               model: imageModel,
               quality: "high",
               size: "1536x1024",
+              action: "generate",
             },
           ],
           reasoning: { effort: "medium" },
@@ -1139,14 +1468,16 @@ async function tryResponsesImageTool(prompt, referenceImageBase64) {
     } finally {
       clearTimeout(timeout);
     }
+    }
   }
   return null;
 }
 
-async function tryImageApi(v1, model, prompt) {
+async function tryImageApi(v1, prompt) {
   const endpoint = `${v1}/images/generations`;
 
-  for (const apiKey of getOpenAIKeyPool()) {
+  for (const model of getImageApiModelCandidates()) {
+    for (const apiKey of getOpenAIKeyPool()) {
     const keyLabel = getOpenAIKeyLabel(apiKey);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), getImageRequestTimeoutMs());
@@ -1181,6 +1512,7 @@ async function tryImageApi(v1, model, prompt) {
       log(`Image API ${keyLabel} threw ${formatUnknownError(error)}`);
     } finally {
       clearTimeout(timeout);
+    }
     }
   }
   return null;
@@ -1336,130 +1668,56 @@ async function createOutpaintMask(width, height, overlapWidth) {
 }
 
 function fallbackPrompt(theme) {
-  return `以「${theme}」为主题生成连续横向画卷，保持统一风格、空间连续和左到右叙事。`;
+  return `以「${theme}」为唯一核心主题生成连续横向画卷，保留主题中的关键人物、地点、时代、材质与气质。画面保持统一的视觉风格、色彩温度、笔触密度、光照方向和空间透视，从左到右自然推进叙事；每一段都延续上一段右侧边缘的道路、水系、建筑、人群、地平线和远景层次，避免突然切换场景。`;
 }
 
-const PLAN_ARCS = [
-  {
-    title: "河岸街市延展",
-    newScene: "向右展开河岸茶肆、卸货小船、挑担行人、临街摊铺与停靠车马，让市井活动从上一段自然延伸。",
-  },
-  {
-    title: "桥市人潮推进",
-    newScene: "展开桥头人潮、货担队列、临水店铺、船工与看客，使道路和河道同时向右推进。",
-  },
-  {
-    title: "城门道路承接",
-    newScene: "展开通向城门的道路、驴车、行商、守门兵士与墙根摊贩，让空间从郊野进入城郭。",
-  },
-  {
-    title: "坊巷商铺展开",
-    newScene: "展开茶楼酒肆、幌子招牌、门前顾客、穿街儿童和运货车马，让街市密度逐步升高。",
-  },
-  {
-    title: "水巷宅院过渡",
-    newScene: "展开水边宅院、柳树、石阶、停泊小舟与搬运行人，让繁华街市暂时转入生活场景。",
-  },
-  {
-    title: "远郊田畴续写",
-    newScene: "展开田畴、村舍、驿路、农人和远山薄雾，让画卷节奏从密集市井舒缓过渡。",
-  },
-];
-
-function cleanPlanText(value) {
-  return String(value ?? "").replace(/\s+/g, " ").trim();
+function summarizePreviousPrompt(value, maxLength = 360) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
-function pickPlanArc(targetIndex) {
-  return PLAN_ARCS[Math.abs(targetIndex - 1) % PLAN_ARCS.length];
-}
-
-function createCreativePlan(input) {
-  const targetIndex = Math.max(1, Math.floor(Number(input.targetIndex ?? 1)));
-  const isFirst = targetIndex === 1;
-  const arc = pickPlanArc(targetIndex);
-  const theme = cleanPlanText(input.theme) || "连续横向中国手卷";
-  const optimizedPrompt = cleanPlanText(input.optimizedPrompt);
-  const previousPrompt = cleanPlanText(input.previousPrompt);
-  const continuityAnchor = isFirst
-    ? "建立可持续延展的河道、道路、屋檐高度、远山层次和人群动线，为后续画面留下清晰右缘。"
-    : "锁定上一张右缘的河道水线、桥梁弧线、岸边道路、屋檐高度和人群行进方向。";
-  const composition = isFirst
-    ? "主体从中景展开，右缘保留可继续延伸的道路、水系、建筑轮廓和人物方向。"
-    : "左侧重叠区只负责承接，主体事件放在中右部；河道、道路和屋檐线保持同一消失方向。";
-  const forbidden = isFirst
-    ? "不得出现现代物品、文字、水印、边框或孤立大特写；不得把第一张画成封面海报。"
-    : "不得改动左侧重叠区；不得突然换时代、季节、视角或光照；不得用大面积空景打断画卷节奏。";
-
-  return {
-    title: `第 ${targetIndex} 张：${arc.title}`,
-    continuityAnchor,
-    newScene: arc.newScene,
-    composition,
-    forbidden,
-    promptFragment: [
-      `画卷主题：${theme}`,
-      optimizedPrompt ? `长期风格方向：${optimizedPrompt}` : "",
-      previousPrompt ? `上一张内容线索：${previousPrompt}` : "",
-      input.hasReferenceImage ? "已提供上一张右缘参考图，必须把它作为硬衔接锚点。" : "未提供上一张右缘参考图时，仍要保持横向长卷叙事连续。",
-      `本张计划：${arc.newScene}`,
-      `衔接要求：${continuityAnchor}`,
-      `构图要求：${composition}`,
-      `禁止偏移：${forbidden}`,
-    ]
-      .filter(Boolean)
-      .join("\n"),
-  };
-}
-
-function planField(value) {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function normalizeCreativePlan(value, fallbackInput) {
-  const fallback = createCreativePlan(fallbackInput);
-  if (!value || typeof value !== "object") return fallback;
-  const plan = {
-    title: planField(value.title) || fallback.title,
-    continuityAnchor: planField(value.continuityAnchor) || fallback.continuityAnchor,
-    newScene: planField(value.newScene) || fallback.newScene,
-    composition: planField(value.composition) || fallback.composition,
-    forbidden: planField(value.forbidden) || fallback.forbidden,
-    promptFragment: planField(value.promptFragment),
-  };
-  return {
-    ...plan,
-    promptFragment:
-      plan.promptFragment ||
-      [`本张计划：${plan.newScene}`, `衔接要求：${plan.continuityAnchor}`, `构图要求：${plan.composition}`, `禁止偏移：${plan.forbidden}`].join("\n"),
-  };
-}
-
-function buildCreativePlanPromptSection(plan) {
-  return [
-    "Creative plan for this exact segment:",
-    `Title: ${plan.title}`,
-    `Continuity anchor: ${plan.continuityAnchor}`,
-    `New scene: ${plan.newScene}`,
-    `Composition: ${plan.composition}`,
-    `Forbidden drift: ${plan.forbidden}`,
-    "Follow this plan exactly; the visible generation plan shown to the user is this same plan.",
-    plan.promptFragment,
-  ].join("\n");
+function summarizePreviousPlanForNextPrompt(plan, fallbackPrompt) {
+  if (plan?.mode === "story") {
+    const characters = Array.isArray(plan.characters) && plan.characters.length ? `人物：${plan.characters.join("、")}` : "";
+    return summarizePreviousPrompt(
+      [
+        plan.title ? `上一帧：${plan.title}` : "",
+        plan.chapter ? `章节：${plan.chapter}` : "",
+        characters,
+        plan.location ? `地点：${plan.location}` : "",
+        plan.newScene ? `画面：${plan.newScene}` : "",
+      ]
+        .filter(Boolean)
+        .join("；"),
+      320,
+    );
+  }
+  return summarizePreviousPrompt(fallbackPrompt);
 }
 
 function buildImagePrompt(scroll, targetIndex, hasReferenceImage = false, creativePlan = createCreativePlan({ targetIndex, hasReferenceImage })) {
   const isFirst = targetIndex === 1;
-  const theme = String(scroll.original_theme ?? "清明上河图风格长卷");
+  const theme = String(scroll.original_theme ?? "连续横向画卷");
   const optimizedPrompt = String(scroll.optimized_prompt ?? "");
+  const isStoryMode = creativePlan.mode === "story";
   return [
-    "Create one segment of a continuous horizontal Chinese handscroll painting.",
-    "Visual style: Northern Song dynasty court handscroll, inspired by Along the River During the Qingming Festival, fine ink linework, pale mineral colors, dense but readable market life, ancient Bianjing city atmosphere.",
+    isStoryMode ? "Create one frame of a Journey to the West sequential comic handscroll." : "Create one segment of a continuous horizontal Chinese handscroll painting.",
+    "Visual style must follow the user theme and long-term scroll direction exactly. Do not default to Along the River During the Qingming Festival, Bianjing market scenes, riverbank tea shops, or Northern Song city life unless the user explicitly requested that subject.",
     `User theme: ${theme}`,
     optimizedPrompt ? `Long-term scroll direction: ${optimizedPrompt}` : "",
-    `This is segment ${targetIndex}. ${isFirst ? "Start the scroll naturally with a 4:3 establishing composition." : "The left edge will be replaced with a pixel-perfect overlap from the previous image; focus on generating coherent new content to the right while matching the reference edge."}`,
-    hasReferenceImage ? "A reference image is attached showing the exact previous right edge. Continue from it naturally into the new right-side scene." : "",
+    isStoryMode
+      ? `This is story frame ${creativePlan.storyFrameIndex} of ${creativePlan.storyTotalFrames}. Depict only this storyboard frame; do not foreshadow, skip, merge, or invent later Journey to the West events.`
+      : `This is segment ${targetIndex}. ${isFirst ? "Start the scroll naturally with a 4:3 establishing composition." : "The left edge will be replaced with a pixel-perfect overlap from the previous image; focus on generating coherent new content to the right while matching the reference edge."}`,
+    hasReferenceImage
+      ? isStoryMode
+        ? "A reference image is attached. Use it only for palette, paper texture, and scroll transition; story accuracy has priority over same-location seamlessness."
+        : "A reference image is attached showing the exact previous right edge. Continue from it naturally into the new right-side scene."
+      : "",
     buildCreativePlanPromptSection(creativePlan),
+    isStoryMode
+      ? "Keep character designs consistent across frames: Sun Wukong has monkey features, pilgrim outfit, and golden cudgel; Tang Sanzang wears monk robes; Zhu Bajie carries a rake; Sha Seng carries the luggage pole; White Dragon Horse stays a white horse."
+      : "",
     "No modern objects, no text labels, no UI, no frame, no watermark. Make it feel like a real antique panoramic scroll, not a generic fantasy landscape.",
   ]
     .filter(Boolean)
@@ -1467,9 +1725,9 @@ function buildImagePrompt(scroll, targetIndex, hasReferenceImage = false, creati
 }
 
 function getRatioLabel(isFirst, overlapRatio) {
-  void isFirst;
-  void overlapRatio;
-  return "4:3";
+  if (isFirst) return "4:3";
+  const widthUnits = 4 * (1 + overlapRatio);
+  return `${Number.isInteger(widthUnits) ? widthUnits : widthUnits.toFixed(1)}:3`;
 }
 
 function loadEnv(path) {
@@ -1501,6 +1759,23 @@ function getOpenAIKeyPool() {
 function getOpenAIKeyLabel(apiKey) {
   const index = getOpenAIKeyPool().indexOf(apiKey);
   return `key #${index + 1}`;
+}
+
+function getImageToolModelCandidates() {
+  return buildModelCandidates(getEnvValue("OPENAI_IMAGE_MODEL") || DEFAULT_IMAGE_TOOL_MODEL, getEnvValue("OPENAI_IMAGE_MODEL_FALLBACKS") || DEFAULT_IMAGE_TOOL_FALLBACKS);
+}
+
+function getImageApiModelCandidates() {
+  return buildModelCandidates(getEnvValue("OPENAI_IMAGE_API_MODEL") || DEFAULT_IMAGE_API_MODEL, getEnvValue("OPENAI_IMAGE_API_MODEL_FALLBACKS") || DEFAULT_IMAGE_API_FALLBACKS);
+}
+
+function buildModelCandidates(primary, fallbacks) {
+  return [...new Set([primary, ...fallbacks.split(",")].map((model) => model.trim()).filter(Boolean))];
+}
+
+function getEnvValue(name) {
+  const value = process.env[name]?.trim();
+  return value && value !== "undefined" && value !== "null" ? value : "";
 }
 
 function createOpenAIClient(apiKey) {

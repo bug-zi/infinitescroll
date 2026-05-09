@@ -80,6 +80,10 @@ export function getGenerationPlanItems(jobs: GenerationJob[], scroll: Scroll | u
         createCreativePlan({
           theme: scroll?.originalTheme,
           optimizedPrompt: scroll?.optimizedPrompt,
+          generationMode: scroll?.generationMode,
+          storyTemplate: scroll?.storyTemplate,
+          storyTemplateVersion: scroll?.storyTemplateVersion,
+          storyTotalFrames: scroll?.storyTotalFrames,
           targetIndex: job.targetIndex,
           hasReferenceImage: job.targetIndex > 1,
         }),
@@ -103,6 +107,10 @@ export function getGenerationPlanItems(jobs: GenerationJob[], scroll: Scroll | u
       creativePlan: createCreativePlan({
         theme: scroll.originalTheme,
         optimizedPrompt: scroll.optimizedPrompt,
+        generationMode: scroll.generationMode,
+        storyTemplate: scroll.storyTemplate,
+        storyTemplateVersion: scroll.storyTemplateVersion,
+        storyTotalFrames: scroll.storyTotalFrames,
         targetIndex: scroll.imageCount + 1,
         hasReferenceImage: scroll.imageCount > 0,
       }),

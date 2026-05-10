@@ -1113,8 +1113,8 @@ h4 {
 
 .latest-plan-item {
   grid-column: 1 / -1;
-  grid-template-columns: minmax(120px, 180px) minmax(0, 1fr);
-  align-items: center;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: stretch;
   justify-items: stretch;
   gap: 14px;
   padding: 10px;
@@ -1126,13 +1126,17 @@ h4 {
 .latest-plan-item img {
   width: 100%;
   height: auto;
-  aspect-ratio: 4 / 3;
+  aspect-ratio: 5 / 3;
+  object-fit: cover;
 }
 
 .latest-plan-item div {
-  display: grid;
-  gap: 4px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
   min-width: 0;
+  flex-wrap: wrap;
 }
 
 .latest-plan-item span,
@@ -1159,11 +1163,25 @@ h4 {
   text-align: left;
 }
 
+.full-width-plan-card {
+  grid-column: 1 / -1;
+}
+
 .plan-card-head {
   display: grid;
   grid-template-columns: 58px minmax(0, 1fr);
   align-items: center;
   gap: 12px;
+}
+
+.plan-card-head-full {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 12px;
+  border: 1px solid #ead7b8;
+  border-radius: 7px;
+  background: #fffdf8;
+  justify-self: stretch;
 }
 
 .plan-card-head strong,

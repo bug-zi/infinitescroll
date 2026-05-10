@@ -581,8 +581,8 @@ export function GenerationPlan({ scroll, jobs, images }: { scroll?: Scroll; jobs
           </div>
         ))}
         {items.map((item) => (
-          <div key={item.id} className="plan-item next creative-plan-card">
-            <div className="plan-card-head">
+          <div key={item.id} className="plan-item next creative-plan-card full-width-plan-card">
+            <div className="plan-card-head plan-card-head-full">
               <div className={`countdown-ring ${item.label.tone}`}>{item.label.text}</div>
               <div>
                 <strong>{item.creativePlan.title}</strong>

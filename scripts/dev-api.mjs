@@ -17,6 +17,12 @@ import {
   mapScriptFrameRow,
   normalizeCreativePlan,
 } from "./creative-plan-runtime.mjs";
+import {
+  buildFallbackStyleWarning,
+  buildStyleLockPromptSection,
+  summarizePreviousFrameForNextPrompt,
+  summarizePromptFallback,
+} from "./style-lock-runtime.mjs";
 
 loadEnv(".env.local");
 
@@ -38,7 +44,7 @@ const schedulerState = {
   lastError: null,
 };
 const generationTimeoutMs = Number(process.env.GENERATION_TIMEOUT_MS ?? 12 * 60 * 1000);
-const staleRunningJobMinutes = Number(process.env.STALE_RUNNING_JOB_MINUTES ?? Math.ceil(generationTimeoutMs / 60000) + 3);
+const staleRunningJobMinutes = Number(process.env.STALE_RUNNING_JOB_MINUTES ?? Math.max(30, Math.ceil(generationTimeoutMs / 60000) + 3));
 const SCROLL_IMAGE_HEIGHT = 1152;
 const SCROLL_VISIBLE_WIDTH = 1536;
 const DEFAULT_RESPONSE_MODEL = "gpt-5.5";
@@ -636,6 +642,8 @@ async function generateOneScrollImage(scroll) {
     const now = new Date().toISOString();
     const previousImage = isFirst ? null : await loadPreviousImage(scroll.id, targetIndex - 1);
     const previousVisibleBuffer = previousImage ? await readLocalPublicImage(previousImage.full_image_url) : null;
+    const styleReferenceBuffer = previousVisibleBuffer ? await loadStyleReferenceImageBuffer(scroll.id, targetIndex, previousVisibleBuffer) : null;
+    const styleReferenceImageBase64 = styleReferenceBuffer ? Buffer.from(styleReferenceBuffer).toString("base64") : undefined;
     const referenceImageBase64 =
       previousVisibleBuffer && overlapWidth > 0 ? (await extractRightOverlapByWidth(previousVisibleBuffer, overlapWidth, height)).toString("base64") : undefined;
     const creativePlan = aiScriptFrame?.frame
@@ -658,10 +666,10 @@ async function generateOneScrollImage(scroll) {
     if (JSON.stringify(creativePlan) !== JSON.stringify(job.creative_plan)) {
       await updateJobCreativePlan(job.id, creativePlan, now);
     }
-    const prompt = buildImagePrompt(scroll, targetIndex, Boolean(referenceImageBase64), creativePlan);
+    const prompt = buildImagePrompt(scroll, targetIndex, Boolean(referenceImageBase64), creativePlan, Boolean(styleReferenceImageBase64));
     const generated = await withGenerationTimeout(
       previousVisibleBuffer
-        ? generateOutpaintedImage(prompt, previousVisibleBuffer, overlapRatio, overlapWidth, height, width, referenceImageBase64)
+        ? generateOutpaintedImage(prompt, previousVisibleBuffer, overlapRatio, overlapWidth, height, width, referenceImageBase64, styleReferenceImageBase64)
         : generateImage(prompt, referenceImageBase64),
     );
 
@@ -678,6 +686,18 @@ async function generateOneScrollImage(scroll) {
       generated.bytes = await normalizeImageBuffer(generated.bytes, width, height);
     }
     const hasStitchWarning = typeof stitchQualityScore === "number" && stitchQualityScore < 82;
+    const styleFallbackWarning = buildFallbackStyleWarning(generated.model);
+    const persistCheck = await canPersistGeneratedImageResult(job.id, scroll.id, targetIndex);
+    if (!persistCheck.canPersist) {
+      await finishJob(job.id, "failed", persistCheck.reason);
+      await supabase.from("generation_logs").insert({
+        scroll_id: scroll.id,
+        level: "warning",
+        message: `第 ${targetIndex} 张重复生成已丢弃`,
+        detail: persistCheck.reason,
+      });
+      return { scrollId: scroll.id, targetIndex, skipped: "duplicate_or_released_job", error: persistCheck.reason };
+    }
 
     const imageUrl = await persistImage(scroll.id, targetIndex, generated);
     const { data: image, error: imageError } = await supabase
@@ -746,9 +766,14 @@ async function generateOneScrollImage(scroll) {
 
     await supabase.from("generation_logs").insert({
       scroll_id: scroll.id,
-      level: hasStitchWarning ? "warning" : "success",
+      level: hasStitchWarning || styleFallbackWarning ? "warning" : "success",
       message: `第 ${targetIndex} 张生成成功`,
-      detail: typeof stitchQualityScore === "number" ? `真实图片已生成，衔接评分 ${stitchQualityScore} 分。` : "真实图片已生成并保存到 Supabase Storage。",
+      detail: [
+        typeof stitchQualityScore === "number" ? `真实图片已生成，衔接评分 ${stitchQualityScore} 分。` : "真实图片已生成并保存到 Supabase Storage。",
+        styleFallbackWarning,
+      ]
+        .filter(Boolean)
+        .join("\n"),
     });
     await finishJob(job.id, "succeeded");
 
@@ -826,6 +851,22 @@ async function finishGenerationFailure(jobId, scrollId, targetIndex, errorMessag
     message: `第 ${targetIndex} 张生成失败`,
     detail: String(errorMessage).slice(0, 1000),
   });
+}
+
+async function canPersistGeneratedImageResult(jobId, scrollId, targetIndex) {
+  const [{ data: currentJob, error: jobError }, { data: existingImage, error: imageError }] = await Promise.all([
+    supabase.from("generation_jobs").select("status").eq("id", jobId).maybeSingle(),
+    supabase.from("scroll_images").select("id").eq("scroll_id", scrollId).eq("image_index", targetIndex).maybeSingle(),
+  ]);
+  if (jobError) throw jobError;
+  if (imageError) throw imageError;
+  const canPersist = currentJob?.status === "running" && !existingImage?.id;
+  return {
+    canPersist,
+    reason: existingImage?.id
+      ? `Target image ${targetIndex} already exists; discarding duplicate generated result`
+      : `Job ${jobId} is no longer running; discarding late generated result`,
+  };
 }
 
 function withGenerationTimeout(promise) {
@@ -1320,6 +1361,18 @@ async function loadPreviousImage(scrollId, imageIndex) {
   return data;
 }
 
+async function loadStyleReferenceImageBuffer(scrollId, targetIndex, fallbackBuffer) {
+  if (targetIndex <= 1) return null;
+  try {
+    const referenceImage = await loadPreviousImage(scrollId, 1);
+    if (!referenceImage?.full_image_url) return fallbackBuffer;
+    return await readLocalPublicImage(referenceImage.full_image_url);
+  } catch (error) {
+    log(`style reference image load failed; using previous frame as style reference: ${formatUnknownError(error)}`);
+    return fallbackBuffer;
+  }
+}
+
 async function generateImage(prompt, referenceImageBase64) {
   if (process.env.LOCAL_DETERMINISTIC_IMAGE_GENERATION === "true") return generateDeterministicImage(prompt, 1);
   const baseUrl = (process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/$/, "");
@@ -1334,9 +1387,9 @@ async function generateImage(prompt, referenceImageBase64) {
   return tryImageApi(v1, prompt);
 }
 
-async function generateOutpaintedImage(prompt, previousImageBuffer, overlapRatio, sourceOverlapWidth, sourceHeight, sourceWidth, referenceImageBase64) {
+async function generateOutpaintedImage(prompt, previousImageBuffer, overlapRatio, sourceOverlapWidth, sourceHeight, sourceWidth, referenceImageBase64, styleReferenceImageBase64) {
   if (process.env.LOCAL_DETERMINISTIC_IMAGE_GENERATION === "true") return generateDeterministicImage(prompt, 2);
-  const editResult = await tryImageEditOutpaint(prompt, previousImageBuffer, overlapRatio, sourceOverlapWidth, sourceHeight, sourceWidth);
+  const editResult = await tryImageEditOutpaint(prompt, previousImageBuffer, overlapRatio, sourceOverlapWidth, sourceHeight, sourceWidth, styleReferenceImageBase64);
   if (editResult) return editResult;
   void referenceImageBase64;
   log("outpaint edit failed; refusing plain generation because strict scroll stitching requires edit-based continuation");
@@ -1360,7 +1413,7 @@ async function generateDeterministicImage(prompt, seed) {
   return { prompt, model: "deterministic-local", bytes, mimeType: "image/png", fallback: false };
 }
 
-async function tryImageEditOutpaint(prompt, previousImageBuffer, overlapRatio, sourceOverlapWidth, sourceHeight = 768, sourceWidth) {
+async function tryImageEditOutpaint(prompt, previousImageBuffer, overlapRatio, sourceOverlapWidth, sourceHeight = 768, sourceWidth, styleReferenceImageBase64) {
   const baseUrl = (process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/$/, "");
   const v1 = baseUrl.endsWith("/v1") ? baseUrl : `${baseUrl}/v1`;
   const endpoint = `${v1}/images/edits`;
@@ -1383,6 +1436,9 @@ async function tryImageEditOutpaint(prompt, previousImageBuffer, overlapRatio, s
     form.append("n", "1");
     form.append("image[]", new Blob([new Uint8Array(canvas)], { type: "image/png" }), "canvas.png");
     form.append("image[]", new Blob([new Uint8Array(previousImageBuffer)], { type: "image/png" }), "previous.png");
+    if (styleReferenceImageBase64) {
+      form.append("image[]", new Blob([new Uint8Array(Buffer.from(styleReferenceImageBase64, "base64"))], { type: "image/png" }), "style-reference.png");
+    }
     form.append("mask", new Blob([mask], { type: "image/png" }), "mask.png");
 
     try {
@@ -1672,40 +1728,31 @@ function fallbackPrompt(theme) {
 }
 
 function summarizePreviousPrompt(value, maxLength = 360) {
-  const text = String(value ?? "").replace(/\s+/g, " ").trim();
-  if (!text) return "";
-  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+  return summarizePromptFallback(value, maxLength);
 }
 
 function summarizePreviousPlanForNextPrompt(plan, fallbackPrompt) {
-  if (plan?.mode === "story") {
-    const characters = Array.isArray(plan.characters) && plan.characters.length ? `人物：${plan.characters.join("、")}` : "";
-    return summarizePreviousPrompt(
-      [
-        plan.title ? `上一帧：${plan.title}` : "",
-        plan.chapter ? `章节：${plan.chapter}` : "",
-        characters,
-        plan.location ? `地点：${plan.location}` : "",
-        plan.newScene ? `画面：${plan.newScene}` : "",
-      ]
-        .filter(Boolean)
-        .join("；"),
-      320,
-    );
-  }
-  return summarizePreviousPrompt(fallbackPrompt);
+  return summarizePreviousFrameForNextPrompt(plan, fallbackPrompt);
 }
 
-function buildImagePrompt(scroll, targetIndex, hasReferenceImage = false, creativePlan = createCreativePlan({ targetIndex, hasReferenceImage })) {
+function buildImagePrompt(scroll, targetIndex, hasReferenceImage = false, creativePlan = createCreativePlan({ targetIndex, hasReferenceImage }), hasStyleReferenceImage = false) {
   const isFirst = targetIndex === 1;
   const theme = String(scroll.original_theme ?? "连续横向画卷");
   const optimizedPrompt = String(scroll.optimized_prompt ?? "");
   const isStoryMode = creativePlan.mode === "story";
+  const styleLock = buildStyleLockPromptSection({
+    theme,
+    optimizedPrompt,
+    characterBible: scroll.character_bible,
+    scriptSummary: scroll.script_summary,
+    generationMode: String(scroll.generation_mode ?? creativePlan.mode ?? ""),
+  });
   return [
     isStoryMode ? "Create one frame of a Journey to the West sequential comic handscroll." : "Create one segment of a continuous horizontal Chinese handscroll painting.",
     "Visual style must follow the user theme and long-term scroll direction exactly. Do not default to Along the River During the Qingming Festival, Bianjing market scenes, riverbank tea shops, or Northern Song city life unless the user explicitly requested that subject.",
     `User theme: ${theme}`,
     optimizedPrompt ? `Long-term scroll direction: ${optimizedPrompt}` : "",
+    styleLock,
     isStoryMode
       ? `This is story frame ${creativePlan.storyFrameIndex} of ${creativePlan.storyTotalFrames}. Depict only this storyboard frame; do not foreshadow, skip, merge, or invent later Journey to the West events.`
       : `This is segment ${targetIndex}. ${isFirst ? "Start the scroll naturally with a 4:3 establishing composition." : "The left edge will be replaced with a pixel-perfect overlap from the previous image; focus on generating coherent new content to the right while matching the reference edge."}`,
@@ -1713,6 +1760,9 @@ function buildImagePrompt(scroll, targetIndex, hasReferenceImage = false, creati
       ? isStoryMode
         ? "A reference image is attached. Use it only for palette, paper texture, and scroll transition; story accuracy has priority over same-location seamlessness."
         : "A reference image is attached showing the exact previous right edge. Continue from it naturally into the new right-side scene."
+      : "",
+    hasStyleReferenceImage
+      ? "A first-frame style reference is attached. Match its linework, palette, paper texture, character proportions, figure scale, brush density, and antique scroll finish while still continuing the previous right edge."
       : "",
     buildCreativePlanPromptSection(creativePlan),
     isStoryMode

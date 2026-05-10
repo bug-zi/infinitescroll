@@ -1,4 +1,4 @@
-const DEFAULT_STALE_RUNNING_JOB_MINUTES = 15;
+const DEFAULT_STALE_RUNNING_JOB_MINUTES = 30;
 
 export type CandidateScrollFilters = {
   scrollId?: string;
@@ -36,4 +36,14 @@ export function isStaleRunningJob({
   const nowTime = Date.parse(nowIso);
   if (Number.isNaN(lockedTime) || Number.isNaN(nowTime)) return false;
   return nowTime - lockedTime > staleAfterMinutes * 60000;
+}
+
+export function canPersistGeneratedJobResult({
+  jobStatus,
+  existingImageId,
+}: {
+  jobStatus?: string | null;
+  existingImageId?: string | null;
+}) {
+  return jobStatus === "running" && !existingImageId;
 }

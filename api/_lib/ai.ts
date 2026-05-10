@@ -320,8 +320,9 @@ export async function generateOutpaintedImage(
   overlapWidth?: number,
   height = 768,
   width?: number,
+  styleReferenceImageBase64?: string,
 ): Promise<GeneratedImage> {
-  const edited = await tryImageEditOutpaint(prompt, previousImageBuffer, overlapRatio, overlapWidth, height, width);
+  const edited = await tryImageEditOutpaint(prompt, previousImageBuffer, overlapRatio, overlapWidth, height, width, styleReferenceImageBase64);
   if (edited) return edited;
   void referenceImageBase64;
   return {
@@ -338,6 +339,7 @@ async function tryImageEditOutpaint(
   sourceOverlapWidth?: number,
   sourceHeight = 768,
   sourceWidth?: number,
+  styleReferenceImageBase64?: string,
 ): Promise<GeneratedImage | null> {
   const keys = getOpenAIKeyPool();
   if (!keys.length) return null;
@@ -364,6 +366,9 @@ async function tryImageEditOutpaint(
     form.append("n", "1");
     form.append("image[]", new Blob([new Uint8Array(canvas)], { type: "image/png" }), "canvas.png");
     form.append("image[]", new Blob([new Uint8Array(previousImageBuffer)], { type: "image/png" }), "previous.png");
+    if (styleReferenceImageBase64) {
+      form.append("image[]", new Blob([new Uint8Array(Buffer.from(styleReferenceImageBase64, "base64"))], { type: "image/png" }), "style-reference.png");
+    }
     form.append("mask", new Blob([new Uint8Array(mask)], { type: "image/png" }), "mask.png");
 
     try {

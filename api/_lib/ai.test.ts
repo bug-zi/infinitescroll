@@ -264,6 +264,56 @@ describe("generateOutpaintedImage", () => {
     expect(form.get("input_fidelity")).toBeNull();
   });
 
+  it("sends the first frame as an additional style reference during outpaint edits", async () => {
+    process.env.OPENAI_API_KEY = "test-key";
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          data: [{ b64_json: Buffer.from("png").toString("base64") }],
+        }),
+        { status: 200 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const previousImage = await sharp({
+      create: {
+        width: 1024,
+        height: 768,
+        channels: 3,
+        background: { r: 120, g: 120, b: 120 },
+      },
+    })
+      .png()
+      .toBuffer();
+    const styleReferenceImage = await sharp({
+      create: {
+        width: 1024,
+        height: 768,
+        channels: 3,
+        background: { r: 180, g: 140, b: 90 },
+      },
+    })
+      .png()
+      .toBuffer();
+
+    await generateOutpaintedImage(
+      "continue strictly from the previous segment",
+      previousImage,
+      0.125,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      styleReferenceImage.toString("base64"),
+    );
+
+    const firstCall = fetchMock.mock.calls[0] as unknown as [string, { body: FormData }];
+    const imageEntries = Array.from(firstCall[1].body.entries()).filter(([key]) => key === "image[]");
+
+    expect(imageEntries).toHaveLength(3);
+  });
+
   it("keeps input_fidelity for older edit model fallbacks", async () => {
     process.env.OPENAI_API_KEY = "test-key";
     process.env.OPENAI_API_KEYS = "";

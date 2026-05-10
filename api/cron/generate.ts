@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { generateImage, generateOutpaintedImage, type GeneratedImage } from "../_lib/ai.js";
-import { getCandidateScrollFilters, isStaleRunningJob } from "../_lib/generationPlan.js";
+import { canPersistGeneratedJobResult, getCandidateScrollFilters, isStaleRunningJob } from "../_lib/generationPlan.js";
 import { getScrollImageDimensions } from "../_lib/imageDimensions.js";
 import { calculateVisibleSeamQualityScore, copyPreviousOverlapIntoNewImage, extractRightOverlapByWidth, normalizeImageBuffer } from "../_lib/stitchImages.js";
 import { createSupabaseAdmin } from "../_lib/supabaseAdmin.js";
@@ -9,6 +9,12 @@ import { isCronRequestAuthorized } from "../_lib/cronAuth.js";
 import { buildCreativePlanPromptSection, createCreativePlan, normalizeCreativePlan } from "../../src/lib/creativePlan";
 import { formatUnknownError } from "../../src/lib/errorFormatting.js";
 import { AI_SCRIPT_TEMPLATE, buildAiScriptCreativePlan, mapScriptFrameRow } from "../../src/lib/scriptDraft";
+import {
+  buildFallbackStyleWarning,
+  buildStyleLockPromptSection,
+  summarizePreviousFrameForNextPrompt,
+  summarizePromptFallback,
+} from "../../src/lib/styleLock";
 
 const DEFAULT_MAX_CONCURRENT_JOBS = 2;
 const DEFAULT_GENERATION_TIMEOUT_MS = 12 * 60 * 1000;
@@ -229,6 +235,8 @@ async function generateOneScrollImage(supabase: SupabaseAdmin, scroll: ScrollRow
     const { width, height, overlapWidth, visibleWidth } = getScrollImageDimensions(isFirst, overlapRatio);
     const previousImage = isFirst ? null : await loadPreviousImage(supabase, scroll.id, targetIndex - 1);
     const previousImageBuffer = previousImage ? await readImageBuffer(previousImage.full_image_url) : null;
+    const styleReferenceImageBuffer = previousImageBuffer ? await loadStyleReferenceImageBuffer(supabase, scroll.id, targetIndex, previousImageBuffer) : null;
+    const styleReferenceImageBase64 = styleReferenceImageBuffer ? Buffer.from(styleReferenceImageBuffer).toString("base64") : undefined;
     const referenceImageBase64 =
       previousImageBuffer && overlapWidth > 0 ? (await extractRightOverlapByWidth(previousImageBuffer, overlapWidth, height)).toString("base64") : undefined;
     const creativePlan = aiScriptFrame?.frame
@@ -251,10 +259,10 @@ async function generateOneScrollImage(supabase: SupabaseAdmin, scroll: ScrollRow
     if (JSON.stringify(creativePlan) !== JSON.stringify(job.creative_plan)) {
       await updateJobCreativePlan(supabase, job.id, creativePlan, now);
     }
-    const prompt = buildImagePrompt(scroll, targetIndex, Boolean(previousImageBuffer), creativePlan);
+    const prompt = buildImagePrompt(scroll, targetIndex, Boolean(previousImageBuffer), creativePlan, Boolean(styleReferenceImageBase64));
     const generated: GeneratedImage = await withGenerationTimeout(
       previousImageBuffer
-        ? generateOutpaintedImage(prompt, previousImageBuffer, overlapRatio, referenceImageBase64, overlapWidth, height, width)
+        ? generateOutpaintedImage(prompt, previousImageBuffer, overlapRatio, referenceImageBase64, overlapWidth, height, width, styleReferenceImageBase64)
         : generateImage(prompt, referenceImageBase64),
     );
 
@@ -282,6 +290,18 @@ async function generateOneScrollImage(supabase: SupabaseAdmin, scroll: ScrollRow
       generated.imageBytes = await normalizeImageBuffer(generated.imageBytes, width, height);
     }
     const hasStitchWarning = typeof stitchQualityScore === "number" && stitchQualityScore < 82;
+    const styleFallbackWarning = buildFallbackStyleWarning(generated.model);
+    const persistCheck = await canPersistGeneratedImageResult(supabase, job.id, scroll.id, targetIndex);
+    if (!persistCheck.canPersist) {
+      await finishJob(supabase, job.id, "failed", persistCheck.reason);
+      await supabase.from("generation_logs").insert({
+        scroll_id: scroll.id,
+        level: "warning",
+        message: `第 ${targetIndex} 张重复生成已丢弃`,
+        detail: persistCheck.reason,
+      });
+      return { scrollId: scroll.id, targetIndex, skipped: "duplicate_or_released_job", error: persistCheck.reason };
+    }
 
     const imageUrl = await persistGeneratedImage(supabase, scroll.id, targetIndex, generated.imageBytes, generated.mimeType);
     const { data: image, error: imageError } = await supabase
@@ -344,14 +364,19 @@ async function generateOneScrollImage(supabase: SupabaseAdmin, scroll: ScrollRow
     }, { skip: Boolean(nextFrame?.complete) });
     if (nextFrame?.complete) await markScrollComplete(supabase, scroll.id);
     await finishJob(supabase, job.id, "succeeded");
+    const logDetail = [
+      typeof stitchQualityScore === "number"
+        ? `已生成并应用 ${overlapWidth}px 像素级重叠锁定；真实接缝评分 ${stitchQualityScore} 分。`
+        : `已生成并应用 ${overlapWidth}px 像素级重叠锁定。`,
+      styleFallbackWarning,
+    ]
+      .filter(Boolean)
+      .join("\n");
     await supabase.from("generation_logs").insert({
       scroll_id: scroll.id,
-      level: hasStitchWarning ? "warning" : "success",
+      level: hasStitchWarning || styleFallbackWarning ? "warning" : "success",
       message: `第 ${targetIndex} 张生成成功`,
-      detail:
-        typeof stitchQualityScore === "number"
-          ? `已生成并应用 ${overlapWidth}px 像素级重叠锁定；真实接缝评分 ${stitchQualityScore} 分。`
-          : `已生成并应用 ${overlapWidth}px 像素级重叠锁定。`,
+      detail: logDetail,
     });
 
     return { scrollId: scroll.id, targetIndex, ok: true, imageUrl, imageId: image.id };
@@ -372,6 +397,18 @@ async function loadPreviousImage(supabase: SupabaseAdmin, scrollId: string, imag
   const { data, error } = await queryMaybeActiveRows(buildQuery(true), buildQuery(false));
   if (error) throw error;
   return data;
+}
+
+async function loadStyleReferenceImageBuffer(supabase: SupabaseAdmin, scrollId: string, targetIndex: number, fallbackBuffer: Buffer | Uint8Array) {
+  if (targetIndex <= 1) return null;
+  try {
+    const referenceImage = await loadPreviousImage(supabase, scrollId, 1);
+    if (!referenceImage?.full_image_url) return fallbackBuffer;
+    return (await readImageBuffer(referenceImage.full_image_url)) ?? fallbackBuffer;
+  } catch (error) {
+    console.warn("style reference image load failed; using previous frame as style reference", error);
+    return fallbackBuffer;
+  }
 }
 
 function isMissingCreativePlanColumn(error: unknown) {
@@ -496,6 +533,25 @@ async function finishGenerationFailure(supabase: SupabaseAdmin, jobId: string, s
   });
 }
 
+async function canPersistGeneratedImageResult(supabase: SupabaseAdmin, jobId: string, scrollId: string, targetIndex: number) {
+  const [{ data: currentJob, error: jobError }, { data: existingImage, error: imageError }] = await Promise.all([
+    supabase.from("generation_jobs").select("status").eq("id", jobId).maybeSingle(),
+    supabase.from("scroll_images").select("id").eq("scroll_id", scrollId).eq("image_index", targetIndex).maybeSingle(),
+  ]);
+  if (jobError) throw jobError;
+  if (imageError) throw imageError;
+  const canPersist = canPersistGeneratedJobResult({
+    jobStatus: currentJob?.status,
+    existingImageId: existingImage?.id,
+  });
+  return {
+    canPersist,
+    reason: existingImage?.id
+      ? `Target image ${targetIndex} already exists; discarding duplicate generated result`
+      : `Job ${jobId} is no longer running; discarding late generated result`,
+  };
+}
+
 function withGenerationTimeout<T>(promise: Promise<T>) {
   const timeoutMs = Number(process.env.GENERATION_TIMEOUT_MS ?? DEFAULT_GENERATION_TIMEOUT_MS);
   return Promise.race([
@@ -507,40 +563,37 @@ function withGenerationTimeout<T>(promise: Promise<T>) {
 }
 
 function summarizePreviousPrompt(value: unknown, maxLength = 360) {
-  const text = String(value ?? "").replace(/\s+/g, " ").trim();
-  if (!text) return "";
-  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+  return summarizePromptFallback(value, maxLength);
 }
 
 function summarizePreviousPlanForNextPrompt(plan: Record<string, any>, fallbackPrompt: unknown) {
-  if (plan?.mode === "story") {
-    const characters = Array.isArray(plan.characters) && plan.characters.length ? `人物：${plan.characters.join("、")}` : "";
-    return summarizePreviousPrompt(
-      [
-        plan.title ? `上一帧：${plan.title}` : "",
-        plan.chapter ? `章节：${plan.chapter}` : "",
-        characters,
-        plan.location ? `地点：${plan.location}` : "",
-        plan.newScene ? `画面：${plan.newScene}` : "",
-      ]
-        .filter(Boolean)
-        .join("；"),
-      320,
-    );
-  }
-  return summarizePreviousPrompt(fallbackPrompt);
+  return summarizePreviousFrameForNextPrompt(plan, fallbackPrompt);
 }
 
-function buildImagePrompt(scroll: Record<string, unknown>, targetIndex: number, hasReferenceImage: boolean, creativePlan = createCreativePlan({ targetIndex, hasReferenceImage })) {
+function buildImagePrompt(
+  scroll: Record<string, unknown>,
+  targetIndex: number,
+  hasReferenceImage: boolean,
+  creativePlan = createCreativePlan({ targetIndex, hasReferenceImage }),
+  hasStyleReferenceImage = false,
+) {
   const isFirst = targetIndex === 1;
   const theme = String(scroll.original_theme ?? "连续横向画卷");
   const optimizedPrompt = String(scroll.optimized_prompt ?? "");
   const isStoryMode = creativePlan.mode === "story";
+  const styleLock = buildStyleLockPromptSection({
+    theme,
+    optimizedPrompt,
+    characterBible: scroll.character_bible,
+    scriptSummary: scroll.script_summary,
+    generationMode: String(scroll.generation_mode ?? creativePlan.mode ?? ""),
+  });
   return [
     isStoryMode ? "Create one frame of a Journey to the West sequential comic handscroll." : "Create one segment of a continuous horizontal Chinese handscroll painting.",
     "Visual style must follow the user theme and long-term scroll direction exactly. Do not default to Along the River During the Qingming Festival, Bianjing market scenes, riverbank tea shops, or Northern Song city life unless the user explicitly requested that subject.",
     `User theme: ${theme}`,
     optimizedPrompt ? `Long-term scroll direction: ${optimizedPrompt}` : "",
+    styleLock,
     isStoryMode
       ? `This is story frame ${creativePlan.storyFrameIndex} of ${creativePlan.storyTotalFrames}. Depict only this storyboard frame; do not foreshadow, skip, merge, or invent later Journey to the West events.`
       : `This is segment ${targetIndex}. ${
@@ -552,6 +605,9 @@ function buildImagePrompt(scroll: Record<string, unknown>, targetIndex: number, 
       ? isStoryMode
         ? "Use the supplied left-edge context only for palette, paper texture, and scroll transition; story accuracy has priority over same-location seamlessness."
         : "Use the supplied left-edge context as a hard continuity anchor."
+      : "",
+    hasStyleReferenceImage
+      ? "A first-frame style reference is attached. Match its linework, palette, paper texture, character proportions, figure scale, brush density, and antique scroll finish while still continuing the previous right edge."
       : "",
     buildCreativePlanPromptSection(creativePlan),
     isStoryMode

@@ -43,6 +43,13 @@ describe("GenerationPlan", () => {
     expect(html).toContain("石猴、群猴");
     expect(html).toContain("花果山");
   });
+
+  it("renders the active plan summary as a full-width card header", () => {
+    const html = renderToStaticMarkup(<GenerationPlan scroll={mockScrolls[0]} jobs={mockJobs.slice(0, 1)} images={[]} />);
+
+    expect(html).toContain('class="plan-item next creative-plan-card full-width-plan-card"');
+    expect(html).toContain('class="plan-card-head plan-card-head-full"');
+  });
 });
 
 describe("App topbar", () => {

@@ -1,6 +1,12 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { generateImage, generateOutpaintedImage, type GeneratedImage } from "../_lib/ai.js";
-import { canPersistGeneratedJobResult, getCandidateScrollFilters, isStaleRunningJob } from "../_lib/generationPlan.js";
+import {
+  canPersistGeneratedJobResult,
+  getCandidateScrollFilters,
+  isStaleRunningJob,
+  isStoryTargetBeyondEnd,
+  shouldCompleteStoryAfterFrame,
+} from "../_lib/generationPlan.js";
 import { getScrollImageDimensions } from "../_lib/imageDimensions.js";
 import { calculateVisibleSeamQualityScore, copyPreviousOverlapIntoNewImage, extractRightOverlapByWidth, normalizeImageBuffer } from "../_lib/stitchImages.js";
 import { createSupabaseAdmin } from "../_lib/supabaseAdmin.js";
@@ -111,6 +117,10 @@ export default async function handler(request: VercelRequest, response: VercelRe
 
 async function generateOneScrollImage(supabase: SupabaseAdmin, scroll: ScrollRow) {
   const targetIndex = Number(scroll.image_count ?? 0) + 1;
+  if (isStoryTargetBeyondEnd({ generationMode: scroll.generation_mode, storyTotalFrames: scroll.story_total_frames, targetIndex })) {
+    await markScrollComplete(supabase, scroll.id);
+    return { scrollId: scroll.id, targetIndex, skipped: "story_complete" };
+  }
   const aiScriptFrame = await loadAiScriptFrameIfNeeded(supabase, scroll, targetIndex);
   if (aiScriptFrame?.complete) {
     await markScrollComplete(supabase, scroll.id);
@@ -328,24 +338,27 @@ async function generateOneScrollImage(supabase: SupabaseAdmin, scroll: ScrollRow
     if (imageError) throw imageError;
 
     const nextRunAt = new Date(Date.now() + Number(scroll.interval_minutes ?? 5) * 60000).toISOString();
-    const nextFrame = await loadAiScriptFrameIfNeeded(supabase, scroll, targetIndex + 1);
-    const nextPlan = nextFrame?.frame
-      ? buildAiScriptCreativePlan({
-          frame: nextFrame.frame,
-          totalFrames: Number(scroll.story_total_frames ?? nextFrame.totalFrames),
-          previousSummary: summarizePreviousPlanForNextPrompt(creativePlan, generated.prompt),
-        })
-      : createCreativePlan({
-          theme: scroll.original_theme,
-          optimizedPrompt: scroll.optimized_prompt,
-          generationMode: scroll.generation_mode,
-          storyTemplate: scroll.story_template,
-          storyTemplateVersion: scroll.story_template_version,
-          storyTotalFrames: scroll.story_total_frames,
-          previousPrompt: summarizePreviousPlanForNextPrompt(creativePlan, generated.prompt),
-          targetIndex: targetIndex + 1,
-          hasReferenceImage: true,
-        });
+    const completesStory = shouldCompleteStoryAfterFrame({ generationMode: scroll.generation_mode, storyTotalFrames: scroll.story_total_frames, targetIndex });
+    const nextFrame = completesStory ? { complete: true as const } : await loadAiScriptFrameIfNeeded(supabase, scroll, targetIndex + 1);
+    const nextPlan = nextFrame?.complete
+      ? null
+      : nextFrame?.frame
+        ? buildAiScriptCreativePlan({
+            frame: nextFrame.frame,
+            totalFrames: Number(scroll.story_total_frames ?? nextFrame.totalFrames),
+            previousSummary: summarizePreviousPlanForNextPrompt(creativePlan, generated.prompt),
+          })
+        : createCreativePlan({
+            theme: scroll.original_theme,
+            optimizedPrompt: scroll.optimized_prompt,
+            generationMode: scroll.generation_mode,
+            storyTemplate: scroll.story_template,
+            storyTemplateVersion: scroll.story_template_version,
+            storyTotalFrames: scroll.story_total_frames,
+            previousPrompt: summarizePreviousPlanForNextPrompt(creativePlan, generated.prompt),
+            targetIndex: targetIndex + 1,
+            hasReferenceImage: true,
+          });
     await supabase
       .from("scrolls")
       .update({
@@ -356,12 +369,14 @@ async function generateOneScrollImage(supabase: SupabaseAdmin, scroll: ScrollRow
         updated_at: now,
       })
       .eq("id", scroll.id);
-    await insertQueuedJob(supabase, {
-      scrollId: scroll.id,
-      targetIndex: targetIndex + 1,
-      scheduledFor: nextRunAt,
-      creativePlan: nextPlan,
-    }, { skip: Boolean(nextFrame?.complete) });
+    if (!nextFrame?.complete && nextPlan) {
+      await insertQueuedJob(supabase, {
+        scrollId: scroll.id,
+        targetIndex: targetIndex + 1,
+        scheduledFor: nextRunAt,
+        creativePlan: nextPlan,
+      });
+    }
     if (nextFrame?.complete) await markScrollComplete(supabase, scroll.id);
     await finishJob(supabase, job.id, "succeeded");
     const logDetail = [
@@ -472,6 +487,12 @@ async function markScrollComplete(supabase: SupabaseAdmin, scrollId: string) {
     .update({ status: "complete", auto_generation_enabled: false, updated_at: new Date().toISOString() })
     .eq("id", scrollId);
   if (error) throw error;
+  const { error: jobError } = await supabase
+    .from("generation_jobs")
+    .update({ status: "cancelled", error_message: "Story completed", updated_at: new Date().toISOString() })
+    .eq("scroll_id", scrollId)
+    .eq("status", "queued");
+  if (jobError) throw jobError;
 }
 
 async function readImageBuffer(imageUrl: string) {
@@ -570,7 +591,7 @@ function summarizePreviousPlanForNextPrompt(plan: Record<string, any>, fallbackP
   return summarizePreviousFrameForNextPrompt(plan, fallbackPrompt);
 }
 
-function buildImagePrompt(
+export function buildImagePrompt(
   scroll: Record<string, unknown>,
   targetIndex: number,
   hasReferenceImage: boolean,
@@ -581,6 +602,8 @@ function buildImagePrompt(
   const theme = String(scroll.original_theme ?? "连续横向画卷");
   const optimizedPrompt = String(scroll.optimized_prompt ?? "");
   const isStoryMode = creativePlan.mode === "story";
+  const storyTemplate = String(scroll.story_template ?? creativePlan.storyTemplate ?? "");
+  const isJourneyToWestStory = storyTemplate === "journey_to_west";
   const styleLock = buildStyleLockPromptSection({
     theme,
     optimizedPrompt,
@@ -589,13 +612,17 @@ function buildImagePrompt(
     generationMode: String(scroll.generation_mode ?? creativePlan.mode ?? ""),
   });
   return [
-    isStoryMode ? "Create one frame of a Journey to the West sequential comic handscroll." : "Create one segment of a continuous horizontal Chinese handscroll painting.",
+    isStoryMode
+      ? isJourneyToWestStory
+        ? "Create one frame of a Journey to the West sequential comic handscroll."
+        : "Create one frame of a sequential story handscroll."
+      : "Create one segment of a continuous horizontal Chinese handscroll painting.",
     "Visual style must follow the user theme and long-term scroll direction exactly. Do not default to Along the River During the Qingming Festival, Bianjing market scenes, riverbank tea shops, or Northern Song city life unless the user explicitly requested that subject.",
     `User theme: ${theme}`,
     optimizedPrompt ? `Long-term scroll direction: ${optimizedPrompt}` : "",
     styleLock,
     isStoryMode
-      ? `This is story frame ${creativePlan.storyFrameIndex} of ${creativePlan.storyTotalFrames}. Depict only this storyboard frame; do not foreshadow, skip, merge, or invent later Journey to the West events.`
+      ? `This is story frame ${creativePlan.storyFrameIndex} of ${creativePlan.storyTotalFrames}. Depict only this storyboard frame; do not foreshadow, skip, merge, or invent later story events.`
       : `This is segment ${targetIndex}. ${
           isFirst
             ? "Start the scroll naturally with a 4:3 establishing composition."
@@ -610,7 +637,7 @@ function buildImagePrompt(
       ? "A first-frame style reference is attached. Match its linework, palette, paper texture, character proportions, figure scale, brush density, and antique scroll finish while still continuing the previous right edge."
       : "",
     buildCreativePlanPromptSection(creativePlan),
-    isStoryMode
+    isStoryMode && isJourneyToWestStory
       ? "Keep character designs consistent across frames: Sun Wukong has monkey features, pilgrim outfit, and golden cudgel; Tang Sanzang wears monk robes; Zhu Bajie carries a rake; Sha Seng carries the luggage pole; White Dragon Horse stays a white horse."
       : "",
     "No modern objects, no text labels, no UI, no frame, no watermark.",

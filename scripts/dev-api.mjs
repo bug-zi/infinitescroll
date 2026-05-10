@@ -122,8 +122,9 @@ export async function handleDevApiRequest(req, res) {
     if (req.method === "POST" && url.pathname === "/api/prompts/optimize") {
       const body = await readJson(req);
       const theme = String(body.theme ?? "").trim();
+      const requirements = String(body.requirements ?? "").trim();
       if (!theme) throw new Error("theme is required");
-      const optimizedPrompt = await optimizeTheme(theme);
+      const optimizedPrompt = await optimizeTheme(theme, requirements);
       json(res, 200, { ok: true, optimizedPrompt });
       return;
     }
@@ -621,6 +622,10 @@ async function generateDueImages(scrollId, options = {}) {
 
 async function generateOneScrollImage(scroll) {
   const targetIndex = Number(scroll.image_count ?? 0) + 1;
+  if (isStoryTargetBeyondEnd({ generationMode: scroll.generation_mode, storyTotalFrames: scroll.story_total_frames, targetIndex })) {
+    await markScrollComplete(scroll.id);
+    return { scrollId: scroll.id, targetIndex, skipped: "story_complete" };
+  }
   const aiScriptFrame = await loadAiScriptFrameIfNeeded(scroll, targetIndex);
   if (aiScriptFrame?.complete) {
     await markScrollComplete(scroll.id);
@@ -736,7 +741,8 @@ async function generateOneScrollImage(scroll) {
       })
       .eq("id", scroll.id);
 
-    const nextFrame = await loadAiScriptFrameIfNeeded(scroll, targetIndex + 1);
+    const completesStory = shouldCompleteStoryAfterFrame({ generationMode: scroll.generation_mode, storyTotalFrames: scroll.story_total_frames, targetIndex });
+    const nextFrame = completesStory ? { complete: true } : await loadAiScriptFrameIfNeeded(scroll, targetIndex + 1);
     if (nextFrame?.complete) {
       await markScrollComplete(scroll.id);
     } else {
@@ -910,6 +916,12 @@ async function markScrollComplete(scrollId) {
     .update({ status: "complete", auto_generation_enabled: false, updated_at: new Date().toISOString() })
     .eq("id", scrollId);
   if (error) throw error;
+  const { error: jobError } = await supabase
+    .from("generation_jobs")
+    .update({ status: "cancelled", error_message: "Story completed", updated_at: new Date().toISOString() })
+    .eq("scroll_id", scrollId)
+    .eq("status", "queued");
+  if (jobError) throw jobError;
 }
 
 function getCandidateScrollFilters({ scrollId, manual = false, nowIso = new Date().toISOString() }) {
@@ -940,6 +952,16 @@ function isStaleRunningJob({ lockedAt, nowIso = new Date().toISOString(), staleA
   const nowTime = Date.parse(nowIso);
   if (Number.isNaN(lockedTime) || Number.isNaN(nowTime)) return false;
   return nowTime - lockedTime > staleAfterMinutes * 60000;
+}
+
+function isStoryTargetBeyondEnd({ generationMode, storyTotalFrames, targetIndex }) {
+  const totalFrames = Number(storyTotalFrames ?? 0);
+  return generationMode === "story" && totalFrames > 0 && targetIndex > totalFrames;
+}
+
+function shouldCompleteStoryAfterFrame({ generationMode, storyTotalFrames, targetIndex }) {
+  const totalFrames = Number(storyTotalFrames ?? 0);
+  return generationMode === "story" && totalFrames > 0 && targetIndex >= totalFrames;
 }
 
 async function createRunningJob(scroll, targetIndex, type) {
@@ -1213,8 +1235,8 @@ async function loadLatestImage(scrollId) {
   return data;
 }
 
-async function optimizeTheme(theme) {
-  if (!process.env.DEEPSEEK_API_KEY) return fallbackPrompt(theme);
+async function optimizeTheme(theme, requirements = "") {
+  if (!process.env.DEEPSEEK_API_KEY) return fallbackPrompt(theme, requirements);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), Number(process.env.DEEPSEEK_TIMEOUT_MS ?? 20000));
 
@@ -1232,22 +1254,29 @@ async function optimizeTheme(theme) {
           {
             role: "system",
             content:
-              "你是《无限画卷》的画卷提示词工程师。必须严格围绕用户主题优化提示词，不得替换成无关题材，不得泛化成普通山水或古风模板。输出必须是中文提示词正文，不要标题、解释、编号或 Markdown。提示词要适合横向连续长卷：说明核心题材、时代或世界观、视觉风格、色彩与光照、左到右叙事推进、相邻画面衔接、可持续生成的空间线索。",
+              "你是《无限画卷》的画卷提示词工程师。必须严格围绕用户主题优化提示词，不得替换成无关题材，不得泛化成普通山水或古风模板。用户补充要求优先级高于默认画卷审美；用户明确禁止的风格、媒介、题材或元素必须作为硬约束执行。输出必须是中文提示词正文，不要标题、解释、编号或 Markdown。提示词要适合横向连续长卷：说明核心题材、时代或世界观、视觉风格、色彩与光照、左到右叙事推进、相邻画面衔接、可持续生成的空间线索。",
           },
           {
             role: "user",
-            content: `用户主题：${theme}\n\n请把这个主题优化成一段可直接交给图像模型生成连续横向画卷的提示词。必须保留并强化主题中的关键名词和气质。`,
+            content: [
+              `用户主题：${theme}`,
+              requirements ? `补充要求：${requirements}` : "",
+              "请把这个主题优化成一段可直接交给图像模型生成连续横向画卷的提示词。必须保留并强化主题中的关键名词和气质。",
+              "如果补充要求里出现“不要、不得、禁止、不使用、不用、避免、no、without、avoid”等禁止性表达，不得在输出中重新加入这些被禁止的词、媒介或风格，也不得用同义描述把它们带回。",
+            ]
+              .filter(Boolean)
+              .join("\n\n"),
           },
         ],
         temperature: 0.35,
       }),
     });
 
-    if (!response.ok) return fallbackPrompt(theme);
+    if (!response.ok) return fallbackPrompt(theme, requirements);
     const data = await response.json();
-    return data.choices?.[0]?.message?.content?.trim() || fallbackPrompt(theme);
+    return data.choices?.[0]?.message?.content?.trim() || fallbackPrompt(theme, requirements);
   } catch {
-    return fallbackPrompt(theme);
+    return fallbackPrompt(theme, requirements);
   } finally {
     clearTimeout(timeout);
   }
@@ -1290,7 +1319,8 @@ async function requestDeepSeekScript({ theme, frameCount, requirements, stylePro
         messages: [
           {
             role: "system",
-            content: "你是《无限画卷》的专业编剧和分镜导演。必须输出严格 JSON，不要 Markdown。剧情必须逐帧推进，角色和视觉风格保持一致。",
+            content:
+              "你是《无限画卷》的专业编剧和分镜导演。必须输出严格 JSON，不要 Markdown。剧情必须逐帧推进，角色和视觉风格保持一致。用户补充要求优先级高于默认画卷审美；用户明确禁止的风格、媒介、题材或元素必须作为硬约束执行，并写入 visualStyle、每帧 forbidden 与 visualPromptHint。",
           },
           {
             role: "user",
@@ -1301,6 +1331,7 @@ async function requestDeepSeekScript({ theme, frameCount, requirements, stylePro
               stylePrompt ? `视觉风格提示：${stylePrompt}` : "",
               "请输出 JSON 对象，字段必须包含：title, summary, visualStyle, characterBible, frames。",
               "frames 长度必须等于总帧数，每帧包含 frameIndex, chapter, title, scene, characters, location, mood, continuityAnchor, forbidden, visualPromptHint。",
+              "如果补充要求或视觉风格提示中包含禁止性表达，forbidden 必须逐帧写入这些禁止项；visualStyle 和 visualPromptHint 必须采用用户指定的正向风格，不得把被禁止的媒介或风格带回。",
             ]
               .filter(Boolean)
               .join("\n"),
@@ -1723,8 +1754,9 @@ async function createOutpaintMask(width, height, overlapWidth) {
   return sharp(transparentMask).composite([{ input: lockedArea, left: 0, top: 0 }]).png().toBuffer();
 }
 
-function fallbackPrompt(theme) {
-  return `以「${theme}」为唯一核心主题生成连续横向画卷，保留主题中的关键人物、地点、时代、材质与气质。画面保持统一的视觉风格、色彩温度、笔触密度、光照方向和空间透视，从左到右自然推进叙事；每一段都延续上一段右侧边缘的道路、水系、建筑、人群、地平线和远景层次，避免突然切换场景。`;
+function fallbackPrompt(theme, requirements = "") {
+  const requirementText = String(requirements).trim() ? `严格遵守补充要求：${String(requirements).trim()}。` : "";
+  return `以「${theme}」为唯一核心主题生成连续横向画卷，保留主题中的关键人物、地点、时代、材质与气质。${requirementText}画面保持统一的视觉风格、色彩温度、笔触密度、光照方向和空间透视，从左到右自然推进叙事；每一段都延续上一段右侧边缘的道路、水系、建筑、人群、地平线和远景层次，避免突然切换场景。`;
 }
 
 function summarizePreviousPrompt(value, maxLength = 360) {
@@ -1740,6 +1772,8 @@ function buildImagePrompt(scroll, targetIndex, hasReferenceImage = false, creati
   const theme = String(scroll.original_theme ?? "连续横向画卷");
   const optimizedPrompt = String(scroll.optimized_prompt ?? "");
   const isStoryMode = creativePlan.mode === "story";
+  const storyTemplate = String(scroll.story_template ?? creativePlan.storyTemplate ?? "");
+  const isJourneyToWestStory = storyTemplate === "journey_to_west";
   const styleLock = buildStyleLockPromptSection({
     theme,
     optimizedPrompt,
@@ -1748,13 +1782,17 @@ function buildImagePrompt(scroll, targetIndex, hasReferenceImage = false, creati
     generationMode: String(scroll.generation_mode ?? creativePlan.mode ?? ""),
   });
   return [
-    isStoryMode ? "Create one frame of a Journey to the West sequential comic handscroll." : "Create one segment of a continuous horizontal Chinese handscroll painting.",
+    isStoryMode
+      ? isJourneyToWestStory
+        ? "Create one frame of a Journey to the West sequential comic handscroll."
+        : "Create one frame of a sequential story handscroll."
+      : "Create one segment of a continuous horizontal Chinese handscroll painting.",
     "Visual style must follow the user theme and long-term scroll direction exactly. Do not default to Along the River During the Qingming Festival, Bianjing market scenes, riverbank tea shops, or Northern Song city life unless the user explicitly requested that subject.",
     `User theme: ${theme}`,
     optimizedPrompt ? `Long-term scroll direction: ${optimizedPrompt}` : "",
     styleLock,
     isStoryMode
-      ? `This is story frame ${creativePlan.storyFrameIndex} of ${creativePlan.storyTotalFrames}. Depict only this storyboard frame; do not foreshadow, skip, merge, or invent later Journey to the West events.`
+      ? `This is story frame ${creativePlan.storyFrameIndex} of ${creativePlan.storyTotalFrames}. Depict only this storyboard frame; do not foreshadow, skip, merge, or invent later story events.`
       : `This is segment ${targetIndex}. ${isFirst ? "Start the scroll naturally with a 4:3 establishing composition." : "The left edge will be replaced with a pixel-perfect overlap from the previous image; focus on generating coherent new content to the right while matching the reference edge."}`,
     hasReferenceImage
       ? isStoryMode
@@ -1765,7 +1803,7 @@ function buildImagePrompt(scroll, targetIndex, hasReferenceImage = false, creati
       ? "A first-frame style reference is attached. Match its linework, palette, paper texture, character proportions, figure scale, brush density, and antique scroll finish while still continuing the previous right edge."
       : "",
     buildCreativePlanPromptSection(creativePlan),
-    isStoryMode
+    isStoryMode && isJourneyToWestStory
       ? "Keep character designs consistent across frames: Sun Wukong has monkey features, pilgrim outfit, and golden cudgel; Tang Sanzang wears monk robes; Zhu Bajie carries a rake; Sha Seng carries the luggage pole; White Dragon Horse stays a white horse."
       : "",
     "No modern objects, no text labels, no UI, no frame, no watermark. Make it feel like a real antique panoramic scroll, not a generic fantasy landscape.",

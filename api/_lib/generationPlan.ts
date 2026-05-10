@@ -47,3 +47,29 @@ export function canPersistGeneratedJobResult({
 }) {
   return jobStatus === "running" && !existingImageId;
 }
+
+export function isStoryTargetBeyondEnd({
+  generationMode,
+  storyTotalFrames,
+  targetIndex,
+}: {
+  generationMode?: string | null;
+  storyTotalFrames?: number | string | null;
+  targetIndex: number;
+}) {
+  const totalFrames = Number(storyTotalFrames ?? 0);
+  return generationMode === "story" && totalFrames > 0 && targetIndex > totalFrames;
+}
+
+export function shouldCompleteStoryAfterFrame({
+  generationMode,
+  storyTotalFrames,
+  targetIndex,
+}: {
+  generationMode?: string | null;
+  storyTotalFrames?: number | string | null;
+  targetIndex: number;
+}) {
+  const totalFrames = Number(storyTotalFrames ?? 0);
+  return generationMode === "story" && totalFrames > 0 && targetIndex >= totalFrames;
+}

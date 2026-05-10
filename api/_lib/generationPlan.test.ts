@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { canPersistGeneratedJobResult, getCandidateScrollFilters, isStaleRunningJob } from "./generationPlan";
+import {
+  canPersistGeneratedJobResult,
+  getCandidateScrollFilters,
+  isStaleRunningJob,
+  isStoryTargetBeyondEnd,
+  shouldCompleteStoryAfterFrame,
+} from "./generationPlan";
 
 describe("getCandidateScrollFilters", () => {
   it("allows manual generation for a selected paused scroll", () => {
@@ -69,5 +75,54 @@ describe("canPersistGeneratedJobResult", () => {
 
   it("discards duplicate frame results when the target image already exists", () => {
     expect(canPersistGeneratedJobResult({ jobStatus: "running", existingImageId: "image-45" })).toBe(false);
+  });
+});
+
+describe("story completion", () => {
+  it("marks the last planned story frame as the completion point", () => {
+    expect(
+      shouldCompleteStoryAfterFrame({
+        generationMode: "story",
+        storyTotalFrames: 128,
+        targetIndex: 128,
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps story generation active before the last planned frame", () => {
+    expect(
+      shouldCompleteStoryAfterFrame({
+        generationMode: "story",
+        storyTotalFrames: 128,
+        targetIndex: 127,
+      }),
+    ).toBe(false);
+  });
+
+  it("prevents generating frames beyond the planned story length", () => {
+    expect(
+      isStoryTargetBeyondEnd({
+        generationMode: "story",
+        storyTotalFrames: 128,
+        targetIndex: 129,
+      }),
+    ).toBe(true);
+  });
+
+  it("does not apply story completion rules to free scrolls", () => {
+    expect(
+      shouldCompleteStoryAfterFrame({
+        generationMode: "free",
+        storyTotalFrames: 128,
+        targetIndex: 128,
+      }),
+    ).toBe(false);
+    expect(
+      isStoryTargetBeyondEnd({
+        generationMode: "free",
+        storyTotalFrames: 128,
+        targetIndex: 129,
+      }),
+    ).toBe(false);
   });
 });

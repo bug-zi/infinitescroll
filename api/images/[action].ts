@@ -1,4 +1,5 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
+import { archiveImage, restoreImage } from "../_lib/imageArchive.js";
 import { purgeImage } from "../_lib/scrollPurge.js";
 import { createSupabaseAdmin } from "../_lib/supabaseAdmin.js";
 
@@ -12,6 +13,7 @@ export default async function handler(request: VercelRequest, response: VercelRe
     return;
   }
 
+  const { action } = request.query;
   const imageId = String(request.body?.imageId ?? "");
   if (!isUuid(imageId)) {
     response.status(400).json({ error: "Invalid imageId" });
@@ -19,9 +21,26 @@ export default async function handler(request: VercelRequest, response: VercelRe
   }
 
   try {
-    const result = await purgeImage(createSupabaseAdmin(), imageId);
+    const supabase = createSupabaseAdmin();
+    let result;
+
+    switch (action) {
+      case "delete":
+        result = await archiveImage(supabase, imageId);
+        break;
+      case "restore":
+        result = await restoreImage(supabase, imageId);
+        break;
+      case "purge":
+        result = await purgeImage(supabase, imageId);
+        break;
+      default:
+        response.status(400).json({ error: `Unknown action: ${action}` });
+        return;
+    }
+
     response.status(200).json({ ok: true, ...result });
   } catch (error) {
-    response.status(500).json({ error: error instanceof Error ? error.message : "Purge image failed" });
+    response.status(500).json({ error: error instanceof Error ? error.message : `${String(action)} image failed` });
   }
 }

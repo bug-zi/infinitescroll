@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1a1a2e"/>
+      <stop offset="100%" stop-color="#16213e"/>
+    </linearGradient>
+    <linearGradient id="paint" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#e94560"/>
+      <stop offset="30%" stop-color="#f5a623"/>
+      <stop offset="60%" stop-color="#7c5cfc"/>
+      <stop offset="100%" stop-color="#0abde3"/>
+    </linearGradient>
+  </defs>
+  <!-- Background -->
+  <rect width="64" height="64" rx="14" fill="url(#bg)"/>
+  <!-- Scroll body -->
+  <rect x="10" y="18" width="44" height="28" rx="3" fill="none" stroke="url(#paint)" stroke-width="2.5"/>
+  <!-- Infinity scroll hint - horizonal flowing lines -->
+  <path d="M15 28 Q24 24 32 28 Q40 32 49 28" fill="none" stroke="#e94560" stroke-width="2" stroke-linecap="round" opacity="0.9"/>
+  <path d="M15 34 Q24 30 32 34 Q40 38 49 34" fill="none" stroke="#7c5cfc" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
+  <path d="M15 40 Q24 36 32 40 Q40 44 49 40" fill="none" stroke="#0abde3" stroke-width="2" stroke-linecap="round" opacity="0.5"/>
+  <!-- Scroll rollers -->
+  <rect x="8" y="16" width="4" height="32" rx="2" fill="#f5a623" opacity="0.8"/>
+  <rect x="52" y="16" width="4" height="32" rx="2" fill="#0abde3" opacity="0.8"/>
+</svg>

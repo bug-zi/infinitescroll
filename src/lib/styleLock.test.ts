@@ -24,6 +24,21 @@ describe("buildStyleLockPromptSection", () => {
     expect(section).toContain("paper texture");
     expect(section).toContain("character proportions");
   });
+
+  it("does not inject ink wash or paper texture defaults when the current scroll forbids ink style", () => {
+    const section = buildStyleLockPromptSection({
+      theme: "红楼梦",
+      optimizedPrompt: "采用国风漫画风格，不要用水墨画卷风格，不要宣纸晕染，不要工笔重彩。",
+      characterBible: "清代贵族少年少女，彩色漫画人物设定。",
+      generationMode: "story",
+    });
+
+    expect(section).toContain("国风漫画");
+    expect(section).toContain("Respect the forbidden visual media");
+    expect(section).not.toContain("paper texture");
+    expect(section).not.toContain("wash transparency");
+    expect(section).not.toContain("scroll patina");
+  });
 });
 
 describe("summarizePreviousFrameForNextPrompt", () => {

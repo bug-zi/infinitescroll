@@ -1,5 +1,6 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { archiveImage, restoreImage } from "../_lib/imageArchive.js";
+import { regenerateImage, requestInsertImage } from "../_lib/imageMutations.js";
 import { purgeImage } from "../_lib/scrollPurge.js";
 import { createSupabaseAdmin } from "../_lib/supabaseAdmin.js";
 
@@ -33,6 +34,12 @@ export default async function handler(request: VercelRequest, response: VercelRe
         break;
       case "purge":
         result = await purgeImage(supabase, imageId);
+        break;
+      case "regenerate":
+        result = await regenerateImage(supabase, imageId);
+        break;
+      case "insert":
+        result = await requestInsertImage(supabase, imageId, request.body?.side === "before" ? "before" : "after");
         break;
       default:
         response.status(400).json({ error: `Unknown action: ${action}` });

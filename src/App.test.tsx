@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import { App, GenerationPlan } from "./App";
+import { App, GenerationPlan, ScrollPanoramaViewer, statusText } from "./App";
 import { mockImages, mockJobs, mockScrolls } from "./data/mockData";
 
 describe("GenerationPlan", () => {
@@ -62,6 +62,12 @@ describe("App topbar", () => {
   });
 });
 
+describe("scroll status labels", () => {
+  it("labels completed story scrolls as finished", () => {
+    expect(statusText.complete).toBe("已完结");
+  });
+});
+
 describe("App create scroll entry", () => {
   it("starts with a clickable create entry before asking for a theme", () => {
     const html = renderToStaticMarkup(<App />);
@@ -80,5 +86,35 @@ describe("App create scroll entry", () => {
     expect(html).toContain("输入你想生成的画卷主题");
     expect(html).toContain("让 DeepSeek 丰富提示词");
     expect(html).toContain("确认创建画卷");
+  });
+});
+
+describe("ScrollPanoramaViewer captions", () => {
+  it("renders a readable caption for the initially opened segment", () => {
+    const images = [
+      mockImages[0],
+      {
+        ...mockImages[1],
+        id: "honglou-frame-2",
+        title: "第 2 张：初入荣府",
+        prompt: [
+          "剧情模式：AI 编剧分镜长卷。",
+          "剧情进度：第 2 / 128 帧。",
+          "章节：黛玉进府",
+          "当前剧情帧：初入荣府",
+          "主要人物：林黛玉、贾母",
+          "场景地点：荣国府",
+          "情绪氛围：华贵、拘谨、初见",
+          "当前画面：黛玉轿马进入荣国府，朱门、影壁、丫鬟队列层层展开。",
+        ].join("\n"),
+      },
+    ];
+
+    const html = renderToStaticMarkup(<ScrollPanoramaViewer images={images} initialImageId="honglou-frame-2" onClose={() => undefined} />);
+
+    expect(html).toContain('class="panorama-caption"');
+    expect(html).toContain("第 2 段");
+    expect(html).toContain("初入荣府");
+    expect(html).toContain("黛玉轿马进入荣国府");
   });
 });

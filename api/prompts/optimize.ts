@@ -15,7 +15,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return;
     }
 
-    const optimizedPrompt = await optimizeThemeWithDeepSeek(theme);
+    const requirements = typeof req.body?.requirements === "string" ? req.body.requirements.trim() : "";
+    const optimizedPrompt = await optimizeThemeWithDeepSeek(theme, requirements);
     res.status(200).json({ ok: true, optimizedPrompt });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Prompt optimization failed";

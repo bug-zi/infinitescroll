@@ -2010,7 +2010,7 @@ h4 {
   inset: 0;
   z-index: 30;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
   background:
     radial-gradient(circle at 16% 12%, rgba(206, 151, 76, 0.12), transparent 30%),
     linear-gradient(180deg, rgba(255, 253, 249, 0.96), rgba(242, 235, 224, 0.98)),
@@ -2043,6 +2043,7 @@ h4 {
 
 .panorama-title,
 .panorama-actions,
+.panorama-caption,
 .panorama-hint {
   display: flex;
   align-items: center;
@@ -2126,6 +2127,64 @@ h4 {
   pointer-events: none;
 }
 
+.panorama-caption {
+  position: relative;
+  z-index: 2;
+  gap: 14px;
+  min-height: 72px;
+  padding: 12px 18px 8px;
+  border-top: 1px solid rgba(221, 207, 187, 0.72);
+  background: rgba(255, 253, 249, 0.78);
+  backdrop-filter: blur(14px);
+}
+
+.panorama-caption-eyebrow {
+  flex: 0 0 auto;
+  border: 1px solid rgba(210, 190, 162, 0.86);
+  border-radius: 7px;
+  padding: 6px 9px;
+  color: #6c5844;
+  font-size: 12px;
+  background: rgba(250, 245, 236, 0.92);
+}
+
+.panorama-caption-copy {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  color: #332920;
+}
+
+.panorama-caption-copy strong,
+.panorama-caption-copy span,
+.panorama-caption-copy p {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.panorama-caption-copy strong {
+  font-size: 15px;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.panorama-caption-copy span {
+  color: #786b5f;
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.panorama-caption-copy p {
+  display: -webkit-box;
+  margin: 0;
+  color: #574b40;
+  font-size: 13px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
 .panorama-hint {
   position: relative;
   z-index: 2;
@@ -2163,6 +2222,17 @@ h4 {
 @media (max-width: 860px) {
   .app-shell {
     display: block;
+  }
+
+  .panorama-caption {
+    align-items: flex-start;
+    gap: 10px;
+    min-height: 88px;
+    padding-inline: 12px;
+  }
+
+  .panorama-caption-copy p {
+    -webkit-line-clamp: 3;
   }
 
   .sidebar {

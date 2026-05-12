@@ -397,7 +397,7 @@ export function useInfiniteScrollStore() {
     setSelectedScrollId(id);
   }
 
-  async function optimizePrompt(theme: string) {
+  async function optimizePrompt(theme: string, requirements = "") {
     const cleanTheme = theme.trim();
     if (!cleanTheme) return "";
     setDataMessage("正在使用 AI 优化画卷提示词...");
@@ -405,7 +405,7 @@ export function useInfiniteScrollStore() {
       const response = await fetch("/api/prompts/optimize", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ theme: cleanTheme }),
+        body: JSON.stringify({ theme: cleanTheme, requirements }),
       });
       if (!response.ok) throw new Error(await response.text());
       const payload = (await response.json()) as OptimizePromptApiResponse;

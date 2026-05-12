@@ -46,6 +46,50 @@ describe("POST /api/scripts/draft", () => {
     expect((response.body as any).draft.frames[0]).toMatchObject({ frameIndex: 1, title: "第1幕" });
   });
 
+  it("passes style requirements as hard constraints to DeepSeek script drafting", async () => {
+    process.env.DEEPSEEK_API_KEY = "deepseek-test-key";
+    const content = JSON.stringify({
+      title: "红楼梦",
+      summary: "原著主线国风漫画分镜。",
+      visualStyle: "国风漫画彩色分镜。",
+      characterBible: "宝玉、黛玉、宝钗保持彩色漫画设定。",
+      frames: Array.from({ length: 24 }, (_, index) => ({
+        frameIndex: index + 1,
+        chapter: "黛玉进府",
+        title: `第${index + 1}幕`,
+        scene: `第${index + 1}个红楼梦画面。`,
+        characters: ["林黛玉"],
+        location: "荣国府",
+        mood: "华贵",
+        forbidden: "不得水墨化，不得提前画后续剧情。",
+        visualPromptHint: "国风漫画彩色分镜。",
+      })),
+    });
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { default: handler } = await import("./draft.js");
+    const response = createResponse();
+    await handler(
+      {
+        method: "POST",
+        body: {
+          theme: "红楼梦",
+          frameCount: 24,
+          requirements: "不要用水墨画卷风格，采用国风漫画风格",
+          stylePrompt: "国风漫画彩色分镜",
+        },
+      } as never,
+      response as never,
+    );
+
+    const firstCall = fetchMock.mock.calls[0] as unknown as [unknown, RequestInit];
+    const body = JSON.parse(firstCall[1].body as string);
+    expect(body.messages[0].content).toContain("用户明确禁止的风格、媒介、题材或元素");
+    expect(body.messages[1].content).toContain("补充要求：不要用水墨画卷风格，采用国风漫画风格");
+    expect(body.messages[1].content).toContain("forbidden 必须逐帧写入这些禁止项");
+  });
+
   it("rejects invalid DeepSeek JSON instead of silently creating a weak script", async () => {
     process.env.DEEPSEEK_API_KEY = "deepseek-test-key";
     vi.stubGlobal(

@@ -85,6 +85,14 @@ export function computeInitialPan(layout: PanoramaLayout, imageId: string, viewp
   return layout.totalWidth / 2 - segmentCenter;
 }
 
+export function computeActiveSegmentIndex(layout: PanoramaLayout, panX: number, scale: number) {
+  if (!layout.segments.length) return 0;
+  const centeredContentX = layout.totalWidth / 2 - panX / Math.max(scale, 0.1);
+  const index = layout.segments.findIndex((segment) => centeredContentX >= segment.left && centeredContentX <= segment.left + segment.width);
+  if (index >= 0) return index;
+  return centeredContentX < layout.segments[0].left ? 0 : layout.segments.length - 1;
+}
+
 export function computePanForHeldDirection(currentX: number, direction: "left" | "right", heldMs: number, scale: number) {
   const ramp = Math.min(1, Math.max(0, heldMs) / 1200);
   const speed = 2 + ramp * 18;

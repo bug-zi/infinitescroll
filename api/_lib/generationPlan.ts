@@ -25,7 +25,7 @@ export function getCandidateScrollFilters({
 export function isStaleRunningJob({
   lockedAt,
   nowIso = new Date().toISOString(),
-  staleAfterMinutes = Number(process.env.STALE_RUNNING_JOB_MINUTES ?? DEFAULT_STALE_RUNNING_JOB_MINUTES),
+  staleAfterMinutes = parsePositiveInteger(process.env.STALE_RUNNING_JOB_MINUTES) ?? DEFAULT_STALE_RUNNING_JOB_MINUTES,
 }: {
   lockedAt?: string | null;
   nowIso?: string;
@@ -36,6 +36,13 @@ export function isStaleRunningJob({
   const nowTime = Date.parse(nowIso);
   if (Number.isNaN(lockedTime) || Number.isNaN(nowTime)) return false;
   return nowTime - lockedTime > staleAfterMinutes * 60000;
+}
+
+function parsePositiveInteger(value: string | undefined) {
+  if (!value) return undefined;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+  return Math.floor(parsed);
 }
 
 export function canPersistGeneratedJobResult({

@@ -62,6 +62,17 @@ describe("isStaleRunningJob", () => {
       }),
     ).toBe(false);
   });
+
+  it("falls back to the default stale window when the environment value is invalid", () => {
+    process.env.STALE_RUNNING_JOB_MINUTES = "not-a-number";
+
+    expect(
+      isStaleRunningJob({
+        lockedAt: "2026-05-07T06:20:00.000Z",
+        nowIso: "2026-05-07T07:00:00.000Z",
+      }),
+    ).toBe(true);
+  });
 });
 
 describe("canPersistGeneratedJobResult", () => {

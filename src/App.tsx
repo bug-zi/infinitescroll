@@ -25,8 +25,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { confirmAction } from "./lib/confirmAction";
 import { DEFAULT_LOG_PREVIEW_LIMIT, getRecentLogs, groupLogsByScroll } from "./lib/logViews";
-import { clampScale, computeImmersiveScrollHeight, computeInitialPan, computePanForHeldDirection, computeSegmentLayout, computeVisibleImageLayout, computeZoomAroundPoint } from "./lib/panoramaViewer";
+import { clampScale, computeActiveSegmentIndex, computeImmersiveScrollHeight, computeInitialPan, computePanForHeldDirection, computeSegmentLayout, computeVisibleImageLayout, computeZoomAroundPoint } from "./lib/panoramaViewer";
 import { summarizePrompt } from "./lib/promptDisplay";
+import { buildImageCaption } from "./lib/imageCaption";
 import { FIXED_OVERLAP_RATIO } from "./lib/stitching";
 import { formatStitchScore } from "./lib/stitchQuality";
 import { formatClock, formatDateMinute, getCountdownParts, getGenerationPlanItems } from "./lib/time";
@@ -37,10 +38,10 @@ import type { GenerationJob, GenerationLog, Scroll, ScrollImage } from "./types"
 
 const USER_PROFILE_STORAGE_KEY = "infinite-scroll:user-profile:v1";
 
-const statusText: Record<Scroll["status"], string> = {
+export const statusText: Record<Scroll["status"], string> = {
   generating: "生成中",
   paused: "已暂停",
-  complete: "已完成",
+  complete: "已完结",
 };
 
 type View = "workspace" | "archive" | "console" | "logs" | "settings";
@@ -1073,7 +1074,7 @@ function CreateScrollDialog({
   onCreate,
 }: {
   onClose: () => void;
-  onOptimize: (theme: string) => Promise<string>;
+  onOptimize: (theme: string, requirements?: string) => Promise<string>;
   onDraftScript: (input: { theme: string; frameCount: number; requirements: string; stylePrompt: string }) => Promise<ScriptDraft | null>;
   onCreate: (input: {
     theme: string;
@@ -1115,7 +1116,7 @@ function CreateScrollDialog({
     setError("");
     setIsOptimizing(true);
     setStatus("DeepSeek 正在理解你的主题，并扩展为连续画卷提示词...");
-    const nextPrompt = await onOptimize(cleanTheme);
+    const nextPrompt = await onOptimize(cleanTheme, requirements);
     setIsOptimizing(false);
 
     if (!nextPrompt.trim()) {
@@ -1329,7 +1330,7 @@ function ScrollEditDialog({ scroll, onClose, onSave }: { scroll: Scroll; onClose
   );
 }
 
-function ScrollPanoramaViewer({
+export function ScrollPanoramaViewer({
   images,
   initialImageId,
   onClose,
@@ -1347,14 +1348,19 @@ function ScrollPanoramaViewer({
   const [scale, setScale] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
+  const [isViewPositioned, setIsViewPositioned] = useState(false);
 
   const scrollHeight = computeImmersiveScrollHeight(viewport.height);
   const layout = useMemo(() => computeSegmentLayout(images, scrollHeight), [images, scrollHeight]);
-  const activeIndex = Math.max(0, images.findIndex((image) => image.id === initialImageId));
+  const initialIndex = Math.max(0, images.findIndex((image) => image.id === initialImageId));
+  const activeIndex = isViewPositioned ? computeActiveSegmentIndex(layout, pan.x, scale) : initialIndex;
+  const activeImage = images[activeIndex] ?? images[initialIndex] ?? images[0];
+  const caption = activeImage ? buildImageCaption(activeImage, activeIndex) : null;
 
   const resetView = useCallback(() => {
     setScale(1);
     setPan({ x: computeInitialPan(layout, initialImageId, viewport.width), y: 0 });
+    setIsViewPositioned(true);
   }, [initialImageId, layout, viewport.width]);
 
   useEffect(() => {
@@ -1562,6 +1568,16 @@ function ScrollPanoramaViewer({
           })}
         </div>
       </div>
+      {caption && (
+        <div className="panorama-caption" aria-live="polite">
+          <span className="panorama-caption-eyebrow">{caption.eyebrow}</span>
+          <div className="panorama-caption-copy">
+            <strong>{caption.title}</strong>
+            {caption.details && <span>{caption.details}</span>}
+            <p>{caption.body}</p>
+          </div>
+        </div>
+      )}
       <div className="panorama-hint">
         <span>{Math.round(scale * 100)}%</span>
         <span>按住 ← / → 缓缓移动</span>

@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 import {
   clampScale,
   computeImmersiveScrollHeight,
+  computeActiveSegmentIndex,
   computeInitialPan,
   computePanForHeldDirection,
   computeSegmentLayout,
@@ -72,6 +73,15 @@ describe("panorama viewer math", () => {
     const pan = computeInitialPan(layout, "image-2", 800);
 
     expect(pan).toBe(-16);
+  });
+
+  test("detects the segment currently centered in the panorama viewport", () => {
+    const layout = computeSegmentLayout([image("image-1", 1024), image("image-2", 896), image("image-3", 896)], 192);
+
+    expect(computeActiveSegmentIndex(layout, computeInitialPan(layout, "image-2", 800), 1)).toBe(1);
+    expect(computeActiveSegmentIndex(layout, computeInitialPan(layout, "image-3", 800) * 2, 2)).toBe(2);
+    expect(computeActiveSegmentIndex(layout, 999, 1)).toBe(0);
+    expect(computeActiveSegmentIndex(layout, -999, 1)).toBe(2);
   });
 
   test("held direction movement ramps with hold time and honors direction", () => {

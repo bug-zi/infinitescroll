@@ -14,6 +14,8 @@ export function buildStyleLockPromptSection(input: StyleLockInput) {
   const characterBible = cleanText(input.characterBible);
   const scriptSummary = cleanText(input.scriptSummary);
   const mode = input.generationMode === "story" ? "story storyboard" : "free continuous scroll";
+  const forbiddenMedia = detectForbiddenVisualMedia([theme, optimizedPrompt, characterBible, scriptSummary].join("\n"));
+  const forbidsInkWash = forbiddenMedia.includes("ink-wash");
 
   return [
     "Global Style Lock (highest priority; apply unchanged to every frame):",
@@ -22,9 +24,12 @@ export function buildStyleLockPromptSection(input: StyleLockInput) {
     optimizedPrompt ? `Confirmed long-term visual direction: ${optimizedPrompt}` : "",
     scriptSummary ? `Story summary anchor: ${scriptSummary}` : "",
     characterBible ? `Character design bible: ${characterBible}` : "",
-    "Keep identical linework across frames: same ink thickness, contour style, hatch density, and brush-edge behavior.",
+    forbiddenMedia.length ? `Respect the forbidden visual media exactly: ${forbiddenMedia.join(", ")}.` : "",
+    forbidsInkWash
+      ? "Keep identical comic linework across frames: same clean contour weight, character outline style, hatch density, and cel-shaded edge behavior."
+      : "Keep identical linework across frames: same ink thickness, contour style, hatch density, and brush-edge behavior.",
     "Keep identical palette across frames: same dominant pigments, saturation, contrast, shadow color, and highlight temperature.",
-    "Keep identical paper texture across frames: same aged paper grain, fiber noise, wash transparency, and scroll patina.",
+    forbidsInkWash ? "" : "Keep identical paper texture across frames: same aged paper grain, fiber noise, wash transparency, and scroll patina.",
     "Keep character proportions and costume silhouettes unchanged; recurring characters must keep the same face shape, clothing, props, and posture language.",
     "Keep composition density consistent: similar figure scale, architectural detail density, horizon height, atmospheric depth, and left-to-right reading rhythm.",
     "Do not change painting medium, era, lighting direction, camera distance, brush density, or overall visual language between frames.",
@@ -84,6 +89,32 @@ export function buildFallbackStyleWarning(model: unknown, preferredModel = "gpt-
 
 function cleanText(value: unknown) {
   return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+export function forbidsPaperScrollTexture(input: StyleLockInput | string) {
+  const text =
+    typeof input === "string"
+      ? input
+      : [input.theme, input.optimizedPrompt, input.characterBible, input.scriptSummary].map((value) => cleanText(value)).join("\n");
+  const normalized = cleanText(text).toLowerCase();
+  return (
+    detectForbiddenVisualMedia(normalized).includes("ink-wash") ||
+    /(no|without|avoid|ban|forbid|forbidden|disable|禁止|不得|不要|避免)[^。；;,.，]*?(paper texture|paper border|mounted scroll|antique scroll|xuan paper|ink wash|ink-wash|宣纸|纸边|装裱|水墨|墨色|晕染|工笔重彩)/i.test(
+      normalized,
+    )
+  );
+}
+
+function detectForbiddenVisualMedia(text: string) {
+  const normalized = cleanText(text).toLowerCase();
+  const forbidden: string[] = [];
+  if (/(不要|不得|禁止|不使用|不用|避免|no|without|avoid)[^。；;,.，]*?(水墨|墨色|宣纸|晕染|工笔重彩|ink wash|ink-wash|xuan paper)/i.test(normalized)) {
+    forbidden.push("ink-wash");
+  }
+  if (/(不要|不得|禁止|不使用|不用|避免|no|without|avoid)[^。；;,.，]*?(清明上河图|qingming|bianjing|北宋市井)/i.test(normalized)) {
+    forbidden.push("qingming-market-template");
+  }
+  return forbidden;
 }
 
 function truncate(value: string, maxLength: number) {

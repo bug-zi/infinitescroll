@@ -1,11 +1,13 @@
 ﻿import { createServer } from "node:http";
 import { Buffer } from "node:buffer";
+import { spawn } from "node:child_process";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
 import sharp from "sharp";
 import { persistGeneratedImageToSupabase } from "./dev-storage.mjs";
+import { detectPaperBorderDrift } from "./image-validation.mjs";
 import { createTimeoutFetch } from "./supabase-fetch.mjs";
 import {
   AI_SCRIPT_TEMPLATE,
@@ -20,6 +22,7 @@ import {
 import {
   buildFallbackStyleWarning,
   buildStyleLockPromptSection,
+  forbidsPaperScrollTexture,
   summarizePreviousFrameForNextPrompt,
   summarizePromptFallback,
 } from "./style-lock-runtime.mjs";
@@ -43,8 +46,13 @@ const schedulerState = {
   lastResult: null,
   lastError: null,
 };
-const generationTimeoutMs = Number(process.env.GENERATION_TIMEOUT_MS ?? 12 * 60 * 1000);
-const staleRunningJobMinutes = Number(process.env.STALE_RUNNING_JOB_MINUTES ?? Math.max(30, Math.ceil(generationTimeoutMs / 60000) + 3));
+const DEFAULT_GENERATION_TIMEOUT_MS = 12 * 60 * 1000;
+const DEFAULT_POST_GENERATION_STAGE_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_STALE_RUNNING_JOB_MINUTES = 30;
+const generationTimeoutMs = parsePositiveInteger(process.env.GENERATION_TIMEOUT_MS) ?? DEFAULT_GENERATION_TIMEOUT_MS;
+const postGenerationStageTimeoutMs = parsePositiveInteger(process.env.POST_GENERATION_STAGE_TIMEOUT_MS) ?? DEFAULT_POST_GENERATION_STAGE_TIMEOUT_MS;
+const staleRunningJobMinutes =
+  parsePositiveInteger(process.env.STALE_RUNNING_JOB_MINUTES) ?? Math.max(DEFAULT_STALE_RUNNING_JOB_MINUTES, Math.ceil(generationTimeoutMs / 60000) + 3);
 const SCROLL_IMAGE_HEIGHT = 1152;
 const SCROLL_VISIBLE_WIDTH = 1536;
 const DEFAULT_RESPONSE_MODEL = "gpt-5.5";
@@ -246,6 +254,10 @@ export function startLocalScheduler() {
     });
   }, schedulerState.intervalMs);
   interval.unref?.();
+  runSchedulerTick("startup").catch((error) => {
+    schedulerState.lastError = formatUnknownError(error);
+    log(`scheduler startup tick failed: ${schedulerState.lastError}`);
+  });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
@@ -261,8 +273,10 @@ async function runSchedulerTick(source) {
   try {
     await runOptionalArchiveMaintenance("purge expired archived scrolls", purgeExpiredArchivedScrolls);
     await runOptionalArchiveMaintenance("purge expired archived images", purgeExpiredArchivedImages);
+    const releasedStaleJobs = await releaseStaleRunningJobs("Running job timed out and was released by scheduler");
     const result = await generateDueImages();
-    schedulerState.lastResult = { source, generated: result.length, result };
+    schedulerState.lastResult = { source, generated: result.length, releasedStaleJobs, result };
+    if (releasedStaleJobs) log(`scheduler ${source} released ${releasedStaleJobs} stale running job(s)`);
     if (result.length) log(`scheduler ${source} generated ${result.length} result(s)`);
     return schedulerState.lastResult;
   } catch (error) {
@@ -274,13 +288,21 @@ async function runSchedulerTick(source) {
 }
 
 async function releaseStaleRunningJobsForStatus() {
-  const { data: runningJobs, error } = await supabase.from("generation_jobs").select("id,locked_at").eq("status", "running");
+  return await releaseStaleRunningJobs("运行任务超过超时时间，已由状态检查释放");
+}
+
+async function releaseStaleRunningJobs(errorMessage) {
+  const { data: runningJobs, error } = await supabase.from("generation_jobs").select("id,scroll_id,target_index,locked_at").eq("status", "running");
   if (error) throw error;
+  let released = 0;
   for (const job of runningJobs ?? []) {
     if (isStaleRunningJob({ lockedAt: job.locked_at })) {
-      await finishJob(job.id, "failed", "运行任务超过超时时间，已由状态检查释放");
+      await finishJob(job.id, "failed", errorMessage);
+      released += 1;
+      log(`released stale running job ${job.id} for scroll ${job.scroll_id ?? "unknown"} frame ${job.target_index ?? "unknown"}`);
     }
   }
+  return released;
 }
 
 async function purgeExpiredArchivedScrolls() {
@@ -631,6 +653,10 @@ async function generateOneScrollImage(scroll) {
     await markScrollComplete(scroll.id);
     return { scrollId: scroll.id, targetIndex, skipped: "story_complete" };
   }
+  const existingTargetImage = await loadExistingGeneratedImage(scroll.id, targetIndex);
+  if (existingTargetImage) {
+    return await recoverExistingGeneratedFrame(scroll, targetIndex, existingTargetImage);
+  }
   const runningJob = await loadRunningJob(scroll.id);
   if (runningJob) {
     if (isStaleRunningJob({ lockedAt: runningJob.locked_at })) {
@@ -647,6 +673,11 @@ async function generateOneScrollImage(scroll) {
     const now = new Date().toISOString();
     const previousImage = isFirst ? null : await loadPreviousImage(scroll.id, targetIndex - 1);
     const previousVisibleBuffer = previousImage ? await readLocalPublicImage(previousImage.full_image_url) : null;
+    if (!isFirst && !previousVisibleBuffer) {
+      const message = `Previous frame ${targetIndex - 1} image could not be downloaded; strict scroll continuation requires a reference image`;
+      await finishGenerationFailure(job.id, scroll.id, targetIndex, message);
+      return { scrollId: scroll.id, targetIndex, failed: true, error: message };
+    }
     const styleReferenceBuffer = previousVisibleBuffer ? await loadStyleReferenceImageBuffer(scroll.id, targetIndex, previousVisibleBuffer) : null;
     const styleReferenceImageBase64 = styleReferenceBuffer ? Buffer.from(styleReferenceBuffer).toString("base64") : undefined;
     const referenceImageBase64 =
@@ -682,20 +713,35 @@ async function generateOneScrollImage(scroll) {
       await finishGenerationFailure(job.id, scroll.id, targetIndex, "Image model did not return valid image bytes");
       return { scrollId: scroll.id, targetIndex, failed: true, error: "Image model did not return valid image bytes" };
     }
+    log(`frame ${targetIndex} image generation returned; bytes=${generated.bytes.byteLength}; model=${generated.model}`);
 
     let stitchQualityScore;
     if (previousVisibleBuffer && overlapWidth > 0) {
-      generated.bytes = await copyPreviousOverlapIntoNewImage(generated.bytes, previousVisibleBuffer, overlapWidth, height, overlapRatio, width, Math.round(overlapWidth * 0.25));
-      stitchQualityScore = await calculateVisibleSeamQualityScore(generated.bytes, overlapWidth, height, Math.round(overlapWidth * 0.125));
+      generated.bytes = await withPostGenerationStage(`frame ${targetIndex} overlap postprocess`, () =>
+        copyPreviousOverlapIntoNewImage(generated.bytes, previousVisibleBuffer, overlapWidth, height, overlapRatio, width, Math.round(overlapWidth * 0.25)),
+      );
+      stitchQualityScore = await withPostGenerationStage(`frame ${targetIndex} seam score`, () =>
+        calculateVisibleSeamQualityScore(generated.bytes, overlapWidth, height, Math.round(overlapWidth * 0.125)),
+      );
     } else {
-      generated.bytes = await normalizeImageBuffer(generated.bytes, width, height);
+      generated.bytes = await withPostGenerationStage(`frame ${targetIndex} normalize image`, () => normalizeImageBuffer(generated.bytes, width, height));
     }
     const hasStitchWarning = typeof stitchQualityScore === "number" && stitchQualityScore < 82;
     const styleFallbackWarning = buildFallbackStyleWarning(generated.model);
-    const persistCheck = await canPersistGeneratedImageResult(job.id, scroll.id, targetIndex);
+    if (shouldEnforceFullBleedCanvas(generated.prompt)) {
+      const paperBorderCheck = await withPostGenerationStage(`frame ${targetIndex} full-bleed paper border check`, () => detectPaperBorderDrift(generated.bytes));
+      if (paperBorderCheck.hasPaperBorderDrift) {
+        const message = paperBorderCheck.reason ?? "Generated image contains paper border drift";
+        await finishGenerationFailure(job.id, scroll.id, targetIndex, message);
+        return { scrollId: scroll.id, targetIndex, failed: true, error: message };
+      }
+    }
+    const persistCheck = await withPostGenerationStage(`frame ${targetIndex} persist eligibility check`, () =>
+      canPersistGeneratedImageResult(job.id, scroll.id, targetIndex),
+    );
     if (!persistCheck.canPersist) {
       await finishJob(job.id, "failed", persistCheck.reason);
-      await supabase.from("generation_logs").insert({
+      await safeInsertGenerationLog({
         scroll_id: scroll.id,
         level: "warning",
         message: `第 ${targetIndex} 张重复生成已丢弃`,
@@ -704,73 +750,75 @@ async function generateOneScrollImage(scroll) {
       return { scrollId: scroll.id, targetIndex, skipped: "duplicate_or_released_job", error: persistCheck.reason };
     }
 
-    const imageUrl = await persistImage(scroll.id, targetIndex, generated);
-    const { data: image, error: imageError } = await supabase
-      .from("scroll_images")
-      .insert({
-        scroll_id: scroll.id,
-        image_index: targetIndex,
-        status: "succeeded",
-        full_image_url: imageUrl,
-        prompt: generated.prompt,
-        model: generated.model,
-        file_size_bytes: generated.bytes?.byteLength,
+    const imageUrl = await withPostGenerationStage(`frame ${targetIndex} storage upload`, () => persistImage(scroll.id, targetIndex, generated));
+    const image = await withPostGenerationStage(`frame ${targetIndex} image row insert`, () =>
+      insertGeneratedImageRow(scroll, targetIndex, imageUrl, generated, {
         width,
         height,
-        ratio_label: getRatioLabel(isFirst, overlapRatio),
-        visible_crop: { x: overlapWidth, y: 0, width: visibleWidth, height },
-        overlap_crop: { x: 0, y: 0, width: overlapWidth, height, stitchQualityScore },
-        new_content_crop: { x: overlapWidth, y: 0, width: visibleWidth, height },
-        has_stitch_warning: hasStitchWarning,
-        generated_at: now,
-      })
-      .select()
-      .single();
+        visibleWidth,
+        overlapWidth,
+        overlapRatio,
+        isFirst,
+        stitchQualityScore,
+        hasStitchWarning,
+        now,
+      }),
+    );
 
-    if (imageError) throw imageError;
+    if (!image?.id) throw new Error(`Frame ${targetIndex} image row insert returned no image id`);
 
+    const completedAt = new Date().toISOString();
     const nextRunAt = new Date(Date.now() + Number(scroll.interval_minutes ?? 5) * 60000).toISOString();
-    await supabase
-      .from("scrolls")
-      .update({
-        image_count: targetIndex,
-        last_generated_at: now,
-        next_run_at: nextRunAt,
-        thumbnail_url: imageUrl,
-        updated_at: now,
-      })
-      .eq("id", scroll.id);
+    await withPostGenerationStage(`frame ${targetIndex} scroll row update`, () =>
+      runSupabaseResult(`frame ${targetIndex} scroll row update`, () =>
+        supabase
+          .from("scrolls")
+          .update({
+            image_count: targetIndex,
+            last_generated_at: completedAt,
+            next_run_at: nextRunAt,
+            thumbnail_url: imageUrl,
+            updated_at: completedAt,
+          })
+          .eq("id", scroll.id),
+      ),
+    );
 
     const completesStory = shouldCompleteStoryAfterFrame({ generationMode: scroll.generation_mode, storyTotalFrames: scroll.story_total_frames, targetIndex });
     const nextFrame = completesStory ? { complete: true } : await loadAiScriptFrameIfNeeded(scroll, targetIndex + 1);
     if (nextFrame?.complete) {
       await markScrollComplete(scroll.id);
     } else {
-      await insertQueuedJob({
-        scrollId: scroll.id,
-        targetIndex: targetIndex + 1,
-        scheduledFor: nextRunAt,
-        creativePlan: nextFrame?.frame
-          ? buildAiScriptCreativePlan({
-              frame: nextFrame.frame,
-              totalFrames: Number(scroll.story_total_frames ?? nextFrame.totalFrames),
-              previousSummary: summarizePreviousPlanForNextPrompt(creativePlan, generated.prompt),
-            })
-          : createCreativePlan({
-              theme: scroll.original_theme,
-              optimizedPrompt: scroll.optimized_prompt,
-              generationMode: scroll.generation_mode,
-              storyTemplate: scroll.story_template,
-              storyTemplateVersion: scroll.story_template_version,
-              storyTotalFrames: scroll.story_total_frames,
-              previousPrompt: summarizePreviousPlanForNextPrompt(creativePlan, generated.prompt),
-              targetIndex: targetIndex + 1,
-              hasReferenceImage: true,
-            }),
-      });
+      await withPostGenerationStage(`frame ${targetIndex} queue next frame`, () =>
+        retryTransientOperation(`frame ${targetIndex} queue next frame`, () =>
+          insertQueuedJob({
+            scrollId: scroll.id,
+            targetIndex: targetIndex + 1,
+            scheduledFor: nextRunAt,
+            creativePlan: nextFrame?.frame
+              ? buildAiScriptCreativePlan({
+                  frame: nextFrame.frame,
+                  totalFrames: Number(scroll.story_total_frames ?? nextFrame.totalFrames),
+                  previousSummary: summarizePreviousPlanForNextPrompt(creativePlan, generated.prompt),
+                })
+              : createCreativePlan({
+                  theme: scroll.original_theme,
+                  optimizedPrompt: scroll.optimized_prompt,
+                  generationMode: scroll.generation_mode,
+                  storyTemplate: scroll.story_template,
+                  storyTemplateVersion: scroll.story_template_version,
+                  storyTotalFrames: scroll.story_total_frames,
+                  previousPrompt: summarizePreviousPlanForNextPrompt(creativePlan, generated.prompt),
+                  targetIndex: targetIndex + 1,
+                  hasReferenceImage: true,
+                }),
+          }),
+        ),
+      );
     }
 
-    await supabase.from("generation_logs").insert({
+    await finishJob(job.id, "succeeded");
+    await safeInsertGenerationLog({
       scroll_id: scroll.id,
       level: hasStitchWarning || styleFallbackWarning ? "warning" : "success",
       message: `第 ${targetIndex} 张生成成功`,
@@ -781,7 +829,6 @@ async function generateOneScrollImage(scroll) {
         .filter(Boolean)
         .join("\n"),
     });
-    await finishJob(job.id, "succeeded");
 
     return { scrollId: scroll.id, targetIndex, imageUrl, imageId: image.id, fallback: false };
   } catch (error) {
@@ -789,6 +836,127 @@ async function generateOneScrollImage(scroll) {
     await finishGenerationFailure(job.id, scroll.id, targetIndex, message);
     return { scrollId: scroll.id, targetIndex, failed: true, error: message };
   }
+}
+
+async function insertGeneratedImageRow(scroll, targetIndex, imageUrl, generated, dimensions) {
+  const { width, height, visibleWidth, overlapWidth, overlapRatio, isFirst, stitchQualityScore, hasStitchWarning, now } = dimensions;
+  const payload = {
+    scroll_id: scroll.id,
+    image_index: targetIndex,
+    status: "succeeded",
+    full_image_url: imageUrl,
+    prompt: generated.prompt,
+    model: generated.model,
+    file_size_bytes: generated.bytes?.byteLength,
+    width,
+    height,
+    ratio_label: getRatioLabel(isFirst, overlapRatio),
+    visible_crop: { x: overlapWidth, y: 0, width: visibleWidth, height },
+    overlap_crop: { x: 0, y: 0, width: overlapWidth, height, stitchQualityScore },
+    new_content_crop: { x: overlapWidth, y: 0, width: visibleWidth, height },
+    has_stitch_warning: hasStitchWarning,
+    generated_at: now,
+  };
+  return await retryTransientOperation(`frame ${targetIndex} image row insert`, async () => {
+    const existingBeforeInsert = await loadExistingGeneratedImage(scroll.id, targetIndex);
+    if (existingBeforeInsert) return existingBeforeInsert;
+
+    const { data, error } = await supabase
+        .from("scroll_images")
+        .insert(payload)
+        .select()
+        .single();
+    if (!error) return data;
+
+    const existingAfterInsertError = await loadExistingGeneratedImage(scroll.id, targetIndex);
+    if (existingAfterInsertError) return existingAfterInsertError;
+    throw error;
+  });
+}
+
+async function loadExistingGeneratedImage(scrollId, targetIndex) {
+  const { data, error } = await supabase
+    .from("scroll_images")
+    .select("*")
+    .eq("scroll_id", scrollId)
+    .eq("image_index", targetIndex)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function recoverExistingGeneratedFrame(scroll, targetIndex, image) {
+  const now = new Date().toISOString();
+  const nextRunAt = new Date(Date.now() + Number(scroll.interval_minutes ?? 5) * 60000).toISOString();
+  await withPostGenerationStage(`frame ${targetIndex} recover scroll row update`, () =>
+    runSupabaseResult(`frame ${targetIndex} recover scroll row update`, () =>
+      supabase
+        .from("scrolls")
+        .update({
+          image_count: targetIndex,
+          last_generated_at: image.generated_at ?? image.created_at ?? now,
+          next_run_at: nextRunAt,
+          thumbnail_url: image.full_image_url,
+          updated_at: now,
+        })
+        .eq("id", scroll.id),
+    ),
+  );
+
+  const completesStory = shouldCompleteStoryAfterFrame({ generationMode: scroll.generation_mode, storyTotalFrames: scroll.story_total_frames, targetIndex });
+  const nextFrame = completesStory ? { complete: true } : await loadAiScriptFrameIfNeeded(scroll, targetIndex + 1);
+  if (nextFrame?.complete) {
+    await markScrollComplete(scroll.id);
+  } else {
+    await withPostGenerationStage(`frame ${targetIndex} recover queue next frame`, () =>
+      retryTransientOperation(`frame ${targetIndex} recover queue next frame`, () =>
+        insertQueuedJob({
+          scrollId: scroll.id,
+          targetIndex: targetIndex + 1,
+          scheduledFor: nextRunAt,
+          creativePlan: nextFrame?.frame
+            ? buildAiScriptCreativePlan({
+                frame: nextFrame.frame,
+                totalFrames: Number(scroll.story_total_frames ?? nextFrame.totalFrames),
+                previousSummary: summarizePromptFallback(image.prompt, 240),
+              })
+            : createCreativePlan({
+                theme: scroll.original_theme,
+                optimizedPrompt: scroll.optimized_prompt,
+                generationMode: scroll.generation_mode,
+                storyTemplate: scroll.story_template,
+                storyTemplateVersion: scroll.story_template_version,
+                storyTotalFrames: scroll.story_total_frames,
+                previousPrompt: summarizePromptFallback(image.prompt, 240),
+                targetIndex: targetIndex + 1,
+                hasReferenceImage: true,
+              }),
+        }),
+      ),
+    );
+  }
+
+  await runSupabaseResult(`frame ${targetIndex} recover running jobs`, () =>
+    supabase
+      .from("generation_jobs")
+      .update({
+        status: "succeeded",
+        error_message: "Recovered from an existing generated image row",
+        updated_at: now,
+      })
+      .eq("scroll_id", scroll.id)
+      .eq("target_index", targetIndex)
+      .eq("status", "running"),
+  );
+  await safeInsertGenerationLog({
+    scroll_id: scroll.id,
+    level: "success",
+    message: `第 ${targetIndex} 张已恢复`,
+    detail: "检测到图片已保存但画卷计数未推进，已恢复生成进度并继续排队下一张。",
+  });
+  return { scrollId: scroll.id, targetIndex, recovered: true, imageUrl: image.full_image_url, imageId: image.id };
 }
 
 async function generateNextImageForScroll(scrollId, options = {}) {
@@ -851,7 +1019,7 @@ async function rebuildImagesFromIndex(scrollId, startIndex, targetCount, options
 
 async function finishGenerationFailure(jobId, scrollId, targetIndex, errorMessage) {
   await finishJob(jobId, "failed", errorMessage);
-  await supabase.from("generation_logs").insert({
+  await safeInsertGenerationLog({
     scroll_id: scrollId,
     level: "error",
     message: `第 ${targetIndex} 张生成失败`,
@@ -859,29 +1027,94 @@ async function finishGenerationFailure(jobId, scrollId, targetIndex, errorMessag
   });
 }
 
+async function safeInsertGenerationLog(payload) {
+  await retryTransientOperation(`generation log: ${payload.message ?? "insert"}`, async () => {
+    const { error } = await supabase.from("generation_logs").insert(payload);
+    if (error) throw error;
+  }).catch((error) => {
+    log(`generation log insert skipped after retries: ${formatUnknownError(error)}`);
+  });
+}
+
 async function canPersistGeneratedImageResult(jobId, scrollId, targetIndex) {
-  const [{ data: currentJob, error: jobError }, { data: existingImage, error: imageError }] = await Promise.all([
-    supabase.from("generation_jobs").select("status").eq("id", jobId).maybeSingle(),
-    supabase.from("scroll_images").select("id").eq("scroll_id", scrollId).eq("image_index", targetIndex).maybeSingle(),
-  ]);
-  if (jobError) throw jobError;
-  if (imageError) throw imageError;
-  const canPersist = currentJob?.status === "running" && !existingImage?.id;
-  return {
-    canPersist,
-    reason: existingImage?.id
-      ? `Target image ${targetIndex} already exists; discarding duplicate generated result`
-      : `Job ${jobId} is no longer running; discarding late generated result`,
-  };
+  return await retryTransientOperation(`frame ${targetIndex} persist eligibility check`, async () => {
+    const [{ data: currentJob, error: jobError }, { data: existingImage, error: imageError }] = await Promise.all([
+      supabase.from("generation_jobs").select("status").eq("id", jobId).maybeSingle(),
+      supabase.from("scroll_images").select("id").eq("scroll_id", scrollId).eq("image_index", targetIndex).maybeSingle(),
+    ]);
+    if (jobError) throw jobError;
+    if (imageError) throw imageError;
+    const canPersist = currentJob?.status === "running" && !existingImage?.id;
+    return {
+      canPersist,
+      reason: existingImage?.id
+        ? `Target image ${targetIndex} already exists; discarding duplicate generated result`
+        : `Job ${jobId} is no longer running; discarding late generated result`,
+    };
+  });
+}
+
+async function runSupabaseResult(label, task, maxAttempts = 3) {
+  return await retryTransientOperation(label, async () => {
+    const result = await task();
+    if (result?.error) throw result.error;
+    return result;
+  }, maxAttempts);
+}
+
+async function retryTransientOperation(label, task, maxAttempts = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      if (attempt > 1) log(`${label} retry ${attempt}/${maxAttempts}`);
+      return await task();
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableTransientFetchError(error) || attempt === maxAttempts) throw error;
+      const delayMs = 1000 * attempt;
+      log(`${label} transient failure, retrying in ${delayMs}ms: ${formatUnknownError(error)}`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(`${label} failed`);
+}
+
+function isRetryableTransientFetchError(error) {
+  if (!error || typeof error !== "object") return false;
+  const name = String(error.name ?? "");
+  const message = String(error.message ?? "").toLowerCase();
+  return name === "AbortError" || name === "TypeError" || message.includes("fetch failed") || message.includes("timeout") || message.includes("aborted") || message.includes("network");
 }
 
 function withGenerationTimeout(promise) {
+  let timeout;
   return Promise.race([
     promise,
     new Promise((_, reject) => {
-      setTimeout(() => reject(new Error(`图片生成超过 ${Math.round(generationTimeoutMs / 60000)} 分钟未返回`)), generationTimeoutMs);
+      timeout = setTimeout(() => reject(new Error(`图片生成超过 ${Math.round(generationTimeoutMs / 60000)} 分钟未返回`)), generationTimeoutMs);
     }),
-  ]);
+  ]).finally(() => clearTimeout(timeout));
+}
+
+async function withPostGenerationStage(stageName, task) {
+  const startedAt = Date.now();
+  log(`${stageName} started`);
+  let timeout;
+  try {
+    const result = await Promise.race([
+      task(),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${stageName} timed out after ${Math.round(postGenerationStageTimeoutMs / 1000)} seconds`)), postGenerationStageTimeoutMs);
+      }),
+    ]);
+    log(`${stageName} finished in ${Date.now() - startedAt}ms`);
+    return result;
+  } catch (error) {
+    log(`${stageName} failed after ${Date.now() - startedAt}ms: ${formatUnknownError(error)}`);
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function loadRunningJob(scrollId) {
@@ -934,9 +1167,20 @@ function getCandidateScrollFilters({ scrollId, manual = false, nowIso = new Date
 
 function getImageRequestTimeoutMs() {
   const defaultGenerationTimeoutMs = 12 * 60 * 1000;
+  const defaultImageRequestTimeoutMs = 4 * 60 * 1000;
   const configuredGenerationTimeoutMs = parsePositiveInteger(process.env.GENERATION_TIMEOUT_MS) ?? defaultGenerationTimeoutMs;
   const configuredImageTimeoutMs = parsePositiveInteger(process.env.OPENAI_IMAGE_TIMEOUT_MS);
-  return Math.max(configuredGenerationTimeoutMs, configuredImageTimeoutMs ?? configuredGenerationTimeoutMs);
+  const customGatewayDefaultMs = Math.max(60 * 1000, configuredGenerationTimeoutMs - 60 * 1000);
+  const defaultTimeoutMs = isCustomOpenAICompatibleBaseUrl(getEnvValue("OPENAI_BASE_URL")) ? customGatewayDefaultMs : defaultImageRequestTimeoutMs;
+  return Math.min(configuredGenerationTimeoutMs, configuredImageTimeoutMs ?? defaultTimeoutMs);
+}
+
+function getImageEditRequestTimeoutMs() {
+  const defaultImageEditRequestTimeoutMs = 45 * 1000;
+  const configuredEditTimeoutMs = parsePositiveInteger(process.env.OPENAI_IMAGE_EDIT_TIMEOUT_MS);
+  const imageRequestTimeoutMs = getImageRequestTimeoutMs();
+  const defaultTimeoutMs = isCustomOpenAICompatibleBaseUrl(getEnvValue("OPENAI_BASE_URL")) ? imageRequestTimeoutMs : defaultImageEditRequestTimeoutMs;
+  return Math.min(imageRequestTimeoutMs, configuredEditTimeoutMs ?? defaultTimeoutMs);
 }
 
 function parsePositiveInteger(value) {
@@ -944,6 +1188,16 @@ function parsePositiveInteger(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
   return Math.floor(parsed);
+}
+
+function isCustomOpenAICompatibleBaseUrl(value) {
+  if (!value) return false;
+  try {
+    const hostname = new URL(value).hostname.toLowerCase();
+    return hostname !== "api.openai.com" && !hostname.endsWith(".openai.com");
+  } catch {
+    return false;
+  }
 }
 
 function isStaleRunningJob({ lockedAt, nowIso = new Date().toISOString(), staleAfterMinutes = staleRunningJobMinutes }) {
@@ -1063,15 +1317,16 @@ async function createRunningJob(scroll, targetIndex, type) {
 }
 
 async function finishJob(jobId, status, errorMessage) {
-  const { error } = await supabase
-    .from("generation_jobs")
-    .update({
-      status,
-      error_message: errorMessage ?? null,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", jobId);
-  if (error) throw error;
+  await runSupabaseResult(`finish job ${jobId}`, () =>
+    supabase
+      .from("generation_jobs")
+      .update({
+        status,
+        error_message: errorMessage ?? null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", jobId),
+  );
 }
 
 function isMissingCreativePlanColumn(error) {
@@ -1397,7 +1652,7 @@ async function loadStyleReferenceImageBuffer(scrollId, targetIndex, fallbackBuff
   try {
     const referenceImage = await loadPreviousImage(scrollId, 1);
     if (!referenceImage?.full_image_url) return fallbackBuffer;
-    return await readLocalPublicImage(referenceImage.full_image_url);
+    return (await readLocalPublicImage(referenceImage.full_image_url)) ?? fallbackBuffer;
   } catch (error) {
     log(`style reference image load failed; using previous frame as style reference: ${formatUnknownError(error)}`);
     return fallbackBuffer;
@@ -1406,8 +1661,15 @@ async function loadStyleReferenceImageBuffer(scrollId, targetIndex, fallbackBuff
 
 async function generateImage(prompt, referenceImageBase64) {
   if (process.env.LOCAL_DETERMINISTIC_IMAGE_GENERATION === "true") return generateDeterministicImage(prompt, 1);
-  const baseUrl = (process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/$/, "");
+  const baseUrl = (getEnvValue("OPENAI_BASE_URL") || "https://api.openai.com/v1").replace(/\/$/, "");
   const v1 = baseUrl.endsWith("/v1") ? baseUrl : `${baseUrl}/v1`;
+  const preferImageApi = shouldPreferImageApi(baseUrl);
+
+  if (preferImageApi) {
+    const imageApiResult = await tryImageApi(v1, compactPromptForImageApi(prompt));
+    if (imageApiResult) return imageApiResult;
+  }
+
   const responsesResult = await tryResponsesImageTool(prompt, referenceImageBase64);
   if (responsesResult) return responsesResult;
   if (referenceImageBase64) {
@@ -1415,14 +1677,18 @@ async function generateImage(prompt, referenceImageBase64) {
     const textOnlyResponsesResult = await tryResponsesImageTool(prompt, undefined);
     if (textOnlyResponsesResult) return textOnlyResponsesResult;
   }
-  return tryImageApi(v1, prompt);
+  if (!preferImageApi) {
+    const imageApiResult = await tryImageApi(v1, prompt);
+    if (imageApiResult) return imageApiResult;
+  }
+  return fallbackImage(prompt, getImageApiModelCandidates()[0]);
 }
 
 async function generateOutpaintedImage(prompt, previousImageBuffer, overlapRatio, sourceOverlapWidth, sourceHeight, sourceWidth, referenceImageBase64, styleReferenceImageBase64) {
   if (process.env.LOCAL_DETERMINISTIC_IMAGE_GENERATION === "true") return generateDeterministicImage(prompt, 2);
+  void referenceImageBase64;
   const editResult = await tryImageEditOutpaint(prompt, previousImageBuffer, overlapRatio, sourceOverlapWidth, sourceHeight, sourceWidth, styleReferenceImageBase64);
   if (editResult) return editResult;
-  void referenceImageBase64;
   log("outpaint edit failed; refusing plain generation because strict scroll stitching requires edit-based continuation");
   return { prompt, model: `${getImageApiModelCandidates()[0]} edit-outpaint failed`, fallback: true };
 }
@@ -1444,8 +1710,31 @@ async function generateDeterministicImage(prompt, seed) {
   return { prompt, model: "deterministic-local", bytes, mimeType: "image/png", fallback: false };
 }
 
+async function fallbackImage(prompt, model) {
+  const bytes = await getLocalFallbackImageBytes();
+  return {
+    imageUrl: "/assets/scroll-segment.svg",
+    model: `${model} local fallback`,
+    prompt,
+    bytes,
+    mimeType: "image/png",
+    fallback: true,
+  };
+}
+
+let localFallbackImageBytesPromise = null;
+
+function getLocalFallbackImageBytes() {
+  if (!localFallbackImageBytesPromise) {
+    localFallbackImageBytesPromise = sharp(readFileSync(new URL("../public/assets/scroll-segment.svg", import.meta.url)))
+      .png()
+      .toBuffer();
+  }
+  return localFallbackImageBytesPromise;
+}
+
 async function tryImageEditOutpaint(prompt, previousImageBuffer, overlapRatio, sourceOverlapWidth, sourceHeight = 768, sourceWidth, styleReferenceImageBase64) {
-  const baseUrl = (process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/$/, "");
+  const baseUrl = (getEnvValue("OPENAI_BASE_URL") || "https://api.openai.com/v1").replace(/\/$/, "");
   const v1 = baseUrl.endsWith("/v1") ? baseUrl : `${baseUrl}/v1`;
   const endpoint = `${v1}/images/edits`;
   const editWidth = sourceWidth ?? 1536;
@@ -1456,8 +1745,9 @@ async function tryImageEditOutpaint(prompt, previousImageBuffer, overlapRatio, s
   for (const model of getImageApiModelCandidates()) {
     for (const apiKey of getOpenAIKeyPool()) {
     const keyLabel = getOpenAIKeyLabel(apiKey);
+    const imageTimeoutMs = getImageEditRequestTimeoutMs();
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), getImageRequestTimeoutMs());
+    const timeout = setTimeout(() => controller.abort(), imageTimeoutMs);
     const form = new FormData();
     form.append("model", model);
     form.append("prompt", prompt);
@@ -1491,8 +1781,14 @@ async function tryImageEditOutpaint(prompt, previousImageBuffer, overlapRatio, s
         log(`Image Edit ${keyLabel} returned no image bytes`);
         continue;
       }
-      return { prompt, model: `${model} edit-outpaint (${keyLabel})`, bytes: Buffer.from(base64, "base64"), mimeType: "image/png", fallback: false };
+      const bytes = Buffer.from(base64, "base64");
+      log(`Image Edit ${keyLabel} decoded ${bytes.byteLength} bytes`);
+      return { prompt, model: `${model} edit-outpaint (${keyLabel})`, bytes, mimeType: "image/png", fallback: false };
     } catch (error) {
+      if (isAbortError(error)) {
+        log(`Image Edit ${keyLabel} timed out after ${imageTimeoutMs}ms for ${model}; falling back to reference-guided generation`);
+        return null;
+      }
       log(`Image Edit ${keyLabel} threw ${formatUnknownError(error)}`);
     } finally {
       clearTimeout(timeout);
@@ -1551,6 +1847,10 @@ async function tryResponsesImageTool(prompt, referenceImageBase64) {
 
       return { prompt, model: `${responseModel} + ${imageModel} (${keyLabel})`, bytes: Buffer.from(base64, "base64"), mimeType: "image/png", fallback: false };
     } catch (error) {
+      if (isAbortError(error)) {
+        log(`Responses image tool ${keyLabel} timed out for ${imageModel}; falling back to Image API generation`);
+        return null;
+      }
       log(`Responses image tool ${keyLabel} threw ${formatUnknownError(error)}`);
     } finally {
       clearTimeout(timeout);
@@ -1562,14 +1862,25 @@ async function tryResponsesImageTool(prompt, referenceImageBase64) {
 
 async function tryImageApi(v1, prompt) {
   const endpoint = `${v1}/images/generations`;
+  const useFreshProcess = shouldPreferImageApi(v1);
 
   for (const model of getImageApiModelCandidates()) {
     for (const apiKey of getOpenAIKeyPool()) {
     const keyLabel = getOpenAIKeyLabel(apiKey);
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), getImageRequestTimeoutMs());
+    const imageTimeoutMs = getImageRequestTimeoutMs();
+    const timeout = setTimeout(() => controller.abort(), imageTimeoutMs);
     try {
-      log(`trying Image API model ${model} using ${keyLabel}`);
+      log(`trying Image API model ${model} using ${keyLabel}; promptChars=${prompt.length}; promptPreview=${JSON.stringify(prompt.slice(0, 260))}`);
+      if (useFreshProcess) {
+        const childResult = await runImageApiInFreshProcess({ endpoint, apiKey, model, prompt, timeoutMs: imageTimeoutMs });
+        if (childResult.base64) {
+          log(`Image API ${keyLabel} child response ${childResult.status}, base64=${childResult.base64.length}`);
+          return { prompt, model: `${model} (${keyLabel})`, bytes: Buffer.from(childResult.base64, "base64"), mimeType: "image/png", fallback: false };
+        }
+        log(`Image API ${keyLabel} child response ${childResult.status ?? "error"}, detail=${childResult.error ?? childResult.text ?? ""}`);
+        continue;
+      }
       const response = await fetch(endpoint, {
         method: "POST",
         signal: controller.signal,
@@ -1605,17 +1916,118 @@ async function tryImageApi(v1, prompt) {
   return null;
 }
 
+function runImageApiInFreshProcess({ endpoint, apiKey, model, prompt, timeoutMs }) {
+  const childCode = `
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => input += chunk);
+process.stdin.on("end", async () => {
+  const payload = JSON.parse(input);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), payload.timeoutMs);
+  try {
+    const response = await fetch(payload.endpoint, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        Authorization: "Bearer " + payload.apiKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: payload.model,
+        prompt: payload.prompt,
+        size: "1024x1024",
+        quality: "low",
+        n: 1,
+      }),
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      console.log(JSON.stringify({ status: response.status, text: text.slice(0, 500) }));
+      return;
+    }
+    const data = JSON.parse(text);
+    console.log(JSON.stringify({ status: response.status, base64: data.data?.[0]?.b64_json ?? "" }));
+  } catch (error) {
+    console.log(JSON.stringify({ error: error instanceof Error ? error.message : String(error), errorName: error?.name }));
+  } finally {
+    clearTimeout(timeout);
+  }
+});
+`;
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, ["--input-type=module", "-e", childCode], {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    let stdout = "";
+    let stderr = "";
+    const parentTimeout = setTimeout(() => {
+      child.kill();
+      resolve({ error: `child image request timed out after ${timeoutMs}ms` });
+    }, timeoutMs + 5000);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", (error) => {
+      clearTimeout(parentTimeout);
+      resolve({ error: error.message });
+    });
+    child.on("close", () => {
+      clearTimeout(parentTimeout);
+      try {
+        resolve(JSON.parse(stdout.trim()));
+      } catch {
+        resolve({ error: stderr.trim() || stdout.trim() || "child image request returned no JSON" });
+      }
+    });
+    child.stdin.end(JSON.stringify({ endpoint, apiKey, model, prompt, timeoutMs }));
+  });
+}
+
 async function persistImage(scrollId, targetIndex, generated) {
   return persistGeneratedImageToSupabase({ supabase, bucket: "scroll-images", scrollId, targetIndex, generated });
 }
 
-function readLocalPublicImage(publicUrl) {
-  if (/^https?:\/\//.test(publicUrl)) return fetch(publicUrl).then(async (response) => {
-    if (!response.ok) throw new Error(`Failed to download previous image: ${response.status}`);
-    return Buffer.from(await response.arrayBuffer());
-  });
+async function readLocalPublicImage(publicUrl) {
+  if (/^https?:\/\//.test(publicUrl)) {
+    const timeoutMs = Number(process.env.IMAGE_DOWNLOAD_TIMEOUT_MS ?? 60000);
+    const maxAttempts = parsePositiveInteger(process.env.IMAGE_DOWNLOAD_MAX_ATTEMPTS) ?? 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(publicUrl, { signal: controller.signal });
+        if (response.ok) return Buffer.from(await response.arrayBuffer());
+        log(`previous image download returned ${response.status} for ${publicUrl}`);
+        if (!isRetryableImageDownloadStatus(response.status) || attempt === maxAttempts) {
+          return null;
+        }
+      } catch (error) {
+        log(`previous image download failed for ${publicUrl}: ${formatUnknownError(error)}`);
+        if (!isRetryableTransientFetchError(error) || attempt === maxAttempts) {
+          return null;
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+      const delayMs = 1200 * attempt;
+      log(`retrying previous image download ${attempt + 1}/${maxAttempts} after ${delayMs}ms`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    return null;
+  }
   if (!publicUrl?.startsWith("/")) throw new Error(`Only local public image URLs are supported in dev mode: ${publicUrl}`);
   return readFileSync(`public${publicUrl.replaceAll("/", "\\")}`);
+}
+
+function isRetryableImageDownloadStatus(status) {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
 async function normalizeImageBuffer(imageBuffer, targetWidth, targetHeight) {
@@ -1774,9 +2186,17 @@ function buildImagePrompt(scroll, targetIndex, hasReferenceImage = false, creati
   const isStoryMode = creativePlan.mode === "story";
   const storyTemplate = String(scroll.story_template ?? creativePlan.storyTemplate ?? "");
   const isJourneyToWestStory = storyTemplate === "journey_to_west";
-  const styleLock = buildStyleLockPromptSection({
+  const avoidPaperScrollTexture = forbidsPaperScrollTexture({
     theme,
     optimizedPrompt,
+    characterBible: scroll.character_bible,
+    scriptSummary: scroll.script_summary,
+    generationMode: String(scroll.generation_mode ?? creativePlan.mode ?? ""),
+  });
+  const optimizedPromptForOutput = avoidPaperScrollTexture ? sanitizePaperScrollTriggers(optimizedPrompt) : optimizedPrompt;
+  const styleLock = buildStyleLockPromptSection({
+    theme,
+    optimizedPrompt: optimizedPromptForOutput,
     characterBible: scroll.character_bible,
     scriptSummary: scroll.script_summary,
     generationMode: String(scroll.generation_mode ?? creativePlan.mode ?? ""),
@@ -1785,31 +2205,57 @@ function buildImagePrompt(scroll, targetIndex, hasReferenceImage = false, creati
     isStoryMode
       ? isJourneyToWestStory
         ? "Create one frame of a Journey to the West sequential comic handscroll."
-        : "Create one frame of a sequential story handscroll."
+        : avoidPaperScrollTexture
+          ? "Create one full-bleed horizontal Chinese comic storyboard frame."
+          : "Create one frame of a sequential story handscroll."
       : "Create one segment of a continuous horizontal Chinese handscroll painting.",
     "Visual style must follow the user theme and long-term scroll direction exactly. Do not default to Along the River During the Qingming Festival, Bianjing market scenes, riverbank tea shops, or Northern Song city life unless the user explicitly requested that subject.",
     `User theme: ${theme}`,
-    optimizedPrompt ? `Long-term scroll direction: ${optimizedPrompt}` : "",
+    optimizedPromptForOutput ? `Long-term scroll direction: ${optimizedPromptForOutput}` : "",
     styleLock,
     isStoryMode
       ? `This is story frame ${creativePlan.storyFrameIndex} of ${creativePlan.storyTotalFrames}. Depict only this storyboard frame; do not foreshadow, skip, merge, or invent later story events.`
       : `This is segment ${targetIndex}. ${isFirst ? "Start the scroll naturally with a 4:3 establishing composition." : "The left edge will be replaced with a pixel-perfect overlap from the previous image; focus on generating coherent new content to the right while matching the reference edge."}`,
     hasReferenceImage
       ? isStoryMode
-        ? "A reference image is attached. Use it only for palette, paper texture, and scroll transition; story accuracy has priority over same-location seamlessness."
+        ? avoidPaperScrollTexture
+          ? "A reference image is attached. Use the supplied left-edge context as a hard visual anchor: match composition density, figure scale, linework, color temperature, lighting direction, garden architecture, and canvas boundary. The story may advance, but the medium and canvas edges must not change."
+          : "A reference image is attached. Use it only for palette, paper texture, and scroll transition; story accuracy has priority over same-location seamlessness."
         : "A reference image is attached showing the exact previous right edge. Continue from it naturally into the new right-side scene."
       : "",
     hasStyleReferenceImage
-      ? "A first-frame style reference is attached. Match its linework, palette, paper texture, character proportions, figure scale, brush density, and antique scroll finish while still continuing the previous right edge."
+      ? avoidPaperScrollTexture
+        ? "A first-frame style reference is attached. Match its clean linework, palette, character proportions, figure scale, brush density, and comic rendering while still continuing the previous right edge."
+        : "A first-frame style reference is attached. Match its linework, palette, paper texture, character proportions, figure scale, brush density, and antique scroll finish while still continuing the previous right edge."
       : "",
-    buildCreativePlanPromptSection(creativePlan),
+    avoidPaperScrollTexture
+      ? "Full-bleed canvas requirement: fill the entire 1536x1152 image with scene content. No paper borders, no mounted scroll frame, no blank pale bands, no beige margin, and no top, bottom, left, or right decorative border."
+      : "",
+    avoidPaperScrollTexture ? sanitizePaperScrollTriggers(buildCreativePlanPromptSection(creativePlan)) : buildCreativePlanPromptSection(creativePlan),
     isStoryMode && isJourneyToWestStory
       ? "Keep character designs consistent across frames: Sun Wukong has monkey features, pilgrim outfit, and golden cudgel; Tang Sanzang wears monk robes; Zhu Bajie carries a rake; Sha Seng carries the luggage pole; White Dragon Horse stays a white horse."
       : "",
-    "No modern objects, no text labels, no UI, no frame, no watermark. Make it feel like a real antique panoramic scroll, not a generic fantasy landscape.",
+    avoidPaperScrollTexture
+      ? "No modern objects, no text labels, no UI, no frame, no watermark. Make it feel like a continuous full-bleed panoramic comic scene, not a mounted paper artifact."
+      : "No modern objects, no text labels, no UI, no frame, no watermark. Make it feel like a real antique panoramic scroll, not a generic fantasy landscape.",
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function sanitizePaperScrollTriggers(value) {
+  return String(value ?? "")
+    .replace(/\bhandscroll\b/gi, "horizontal comic sequence")
+    .replace(/\bpaper texture\b/gi, "surface consistency")
+    .replace(/\bscroll transition\b/gi, "visual continuity")
+    .replace(/\bantique scroll finish\b/gi, "comic finish")
+    .replace(/\breal antique panoramic scroll\b/gi, "continuous panoramic comic scene")
+    .replace(/卷轴纹理/g, "画面动线")
+    .replace(/卷轴衔接/g, "画面衔接");
+}
+
+function shouldEnforceFullBleedCanvas(prompt) {
+  return /full-bleed canvas requirement/i.test(prompt) || /no paper borders/i.test(prompt);
 }
 
 function getRatioLabel(isFirst, overlapRatio) {
@@ -1857,6 +2303,56 @@ function getImageApiModelCandidates() {
   return buildModelCandidates(getEnvValue("OPENAI_IMAGE_API_MODEL") || DEFAULT_IMAGE_API_MODEL, getEnvValue("OPENAI_IMAGE_API_MODEL_FALLBACKS") || DEFAULT_IMAGE_API_FALLBACKS);
 }
 
+function shouldPreferImageApi(baseUrl) {
+  const configured = getEnvValue("OPENAI_PREFER_IMAGE_API").toLowerCase();
+  if (["1", "true", "yes", "on"].includes(configured)) return true;
+  if (["0", "false", "no", "off"].includes(configured)) return false;
+  return !isOfficialOpenAIBaseUrl(baseUrl);
+}
+
+function isOfficialOpenAIBaseUrl(baseUrl) {
+  try {
+    return new URL(baseUrl).hostname === "api.openai.com";
+  } catch {
+    return false;
+  }
+}
+
+function compactPromptForImageApi(prompt) {
+  const maxChars = 700;
+  const getValue = (prefix) => {
+    const line = prompt
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .find((item) => item.startsWith(prefix));
+    return line?.slice(prefix.length).trim() ?? "";
+  };
+  const theme = getValue("User theme:") || "连续画卷";
+  const direction = getValue("Long-term scroll direction:");
+  const frameMatch = prompt.match(/This is story frame\s+(\d+)/i);
+  const frameLabel = frameMatch ? `第${frameMatch[1]}帧` : "";
+  const title = getValue("Title:").replace(/^第\s*\d+\s*\/\s*\d+\s*帧[:：]\s*/, "").trim();
+  const characters = getValue("Characters:");
+  const location = getValue("Location:");
+  const mood = getValue("Mood:");
+  const scene = getValue("New scene:");
+  const forbidden = getValue("Forbidden drift:");
+  const style = direction.includes("国风漫画") || direction.includes("彩色分镜")
+    ? "国风漫画彩色分镜，细净勾线，柔和赛璐璐上色，清代服饰，场景设定一致"
+    : (direction.slice(0, 120) || "保持用户指定视觉风格");
+  const forbiddenSummary = forbidden || "现代物品、文字、水印、无关场景";
+  const compact = [
+    `${theme}${style ? `，${style}` : ""}${frameLabel ? `，${frameLabel}` : ""}${title ? `：${title}` : ""}。`,
+    scene ? `${scene}。` : "",
+    characters ? `人物：${characters}。` : "",
+    location ? `地点：${location}。` : "",
+    mood ? `氛围：${mood}。` : "",
+    `禁止：${forbiddenSummary}。只画当前剧情，不提前画后续。`,
+  ].join("");
+
+  return compact.length > 80 ? compact.slice(0, maxChars) : prompt.slice(0, maxChars);
+}
+
 function buildModelCandidates(primary, fallbacks) {
   return [...new Set([primary, ...fallbacks.split(",")].map((model) => model.trim()).filter(Boolean))];
 }
@@ -1869,7 +2365,7 @@ function getEnvValue(name) {
 function createOpenAIClient(apiKey) {
   return new OpenAI({
     apiKey,
-    baseURL: normalizeOpenAIBaseUrl(process.env.OPENAI_BASE_URL),
+    baseURL: normalizeOpenAIBaseUrl(getEnvValue("OPENAI_BASE_URL")),
   });
 }
 
@@ -1927,4 +2423,9 @@ function formatUnknownError(error) {
   if (code && message) return `${code}: ${message}`;
   if (message) return message;
   return safeStringify(error);
+}
+
+function isAbortError(error) {
+  if (!(error instanceof Error)) return false;
+  return error.name === "AbortError" || error.name === "APIUserAbortError" || /aborted|abort/i.test(error.message);
 }

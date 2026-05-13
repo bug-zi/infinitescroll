@@ -1,6 +1,11 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { draftScriptWithDeepSeek } from "../_lib/ai.js";
-import { normalizeFrameCount } from "../../src/lib/scriptDraft.js";
+const SCRIPT_FRAME_COUNTS = [24, 48, 96, 128] as const;
+const DEFAULT_SCRIPT_FRAME_COUNT = 48;
+function normalizeFrameCount(value: unknown) {
+  const count = Number(value);
+  return SCRIPT_FRAME_COUNTS.includes(count as (typeof SCRIPT_FRAME_COUNTS)[number]) ? count : DEFAULT_SCRIPT_FRAME_COUNT;
+}
 
 export default async function handler(request: VercelRequest, response: VercelResponse) {
   if (request.method !== "POST") {

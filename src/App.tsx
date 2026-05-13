@@ -233,7 +233,7 @@ export function App({ initialCreateScrollOpen = false }: { initialCreateScrollOp
         />
       )}
       {viewerInitialImageId && (
-        <ScrollPanoramaViewer images={store.images} scroll={store.currentScroll} initialImageId={viewerInitialImageId} onClose={() => setViewerInitialImageId("")} />
+        <ScrollPanoramaViewer images={store.images} initialImageId={viewerInitialImageId} onClose={() => setViewerInitialImageId("")} />
       )}
       {toastNotification && <GenerationToast notification={toastNotification} onClose={() => setToastNotification(null)} />}
     </div>
@@ -490,9 +490,6 @@ function ScrollHeader(props: {
         <button className="ghost-icon" aria-label="编辑画卷" onClick={props.onEdit}><Edit3 size={16} /></button>
       </div>
       <p className="theme-text">主题描述：{scroll.originalTheme}</p>
-      {scroll.scriptSummary && (
-        <p className="script-summary">{scroll.scriptSummary}</p>
-      )}
       <div className="prompt-box">
         <strong>优化提示词：</strong>
         <p>{scroll.optimizedPrompt || "等待提示词优化..."}</p>
@@ -1335,12 +1332,10 @@ function ScrollEditDialog({ scroll, onClose, onSave }: { scroll: Scroll; onClose
 
 export function ScrollPanoramaViewer({
   images,
-  scroll,
   initialImageId,
   onClose,
 }: {
   images: ScrollImage[];
-  scroll?: Scroll;
   initialImageId: string;
   onClose: () => void;
 }) {
@@ -1581,22 +1576,6 @@ export function ScrollPanoramaViewer({
             {caption.details && <span>{caption.details}</span>}
             <p>{caption.body}</p>
           </div>
-        </div>
-      )}
-      {scroll && (scroll.scriptSummary || scroll.characterBible) && (
-        <div className="panorama-intro">
-          {scroll.scriptSummary && (
-            <div className="panorama-intro-section">
-              <strong>画卷简介</strong>
-              <p>{scroll.scriptSummary}</p>
-            </div>
-          )}
-          {scroll.characterBible && (
-            <div className="panorama-intro-section">
-              <strong>角色设定</strong>
-              <p>{scroll.characterBible}</p>
-            </div>
-          )}
         </div>
       )}
       <div className="panorama-hint">
